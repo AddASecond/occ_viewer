@@ -1,0 +1,8 @@
+.venv/
+.venv_smoke/
+__pycache__/
+*.pyc
+videos/
+job_*.json
+job_*.log
+.DS_Store

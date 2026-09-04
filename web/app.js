@@ -148,28 +148,23 @@ let framePtXYZ = null; // current-frame deskew points, before static aggregation
 let framePtLabels = null;
 let framePtLidar = null;
 /** Clip-level static in map frame (same points every frame; only pose changes). */
-let staticAgg = null; // { xyz: Float32Array, labels: Uint8Array, lidar: Uint8Array, n, voxel }
+let staticAgg = null;
 let roiHelper = null;
 let roi = { x0: -24, x1: 24, y0: -25, y1: 150, z0: -5, z1: 3 };
+let Cdyn, Cfree, Csta, Ccol, Cord, Lcol, nFine;
 
-/** Coarse 4-class mapping (Waymo 22 → dynamic/static/freespace/noise) */
-const COARSE_DYNAMIC = new Set([0, 1, 2, 3, 4, 5, 6, 11, 12]);
-const FINE_DYNAMIC = COARSE_DYNAMIC;
-const COARSE_FREESPACE = new Set([17, 18, 19, 20, 21]);
-const COARSE_STATIC = new Set([7, 8, 9, 10, 13, 14, 15, 16]);
-const COARSE_COLORS = {
-  dynamic: [230, 64, 64],
-  static: [64, 160, 255],
-  freespace: [72, 200, 96],
-  noise: [160, 160, 160],
-};
-const COARSE_ORDER = ["dynamic", "static", "freespace", "noise"];
-/** RGB matching render_robotruck_clip_video LIDAR_ID_BGR */
-const LIDAR_COLORS = {
-  1: [40, 180, 255],
-  2: [40, 220, 40],
-  14: [255, 40, 40],
-};
+function applyProfile(p) {
+  const c = p.taxonomy.coarse, L = p.taxonomy.lidar_ids;
+  Cdyn = new Set(c.fine_ids.dynamic);
+  Cfree = new Set(c.fine_ids.freespace);
+  Csta = new Set(c.fine_ids.static);
+  Ccol = c.colors_rgb;
+  Cord = c.order;
+  Lcol = Object.fromEntries(Object.entries(L.colors_rgb).map(([k, v]) => [+k, v]));
+  nFine = p.taxonomy.fine.n;
+  const r = p.roi;
+  roi = { x0: r.x[0], x1: r.x[1], y0: r.y[0], y1: r.y[1], z0: r.z[0], z1: r.z[1] };
+}
 
 /** Lightbox state */
 let lb = { scale: 1, tx: 0, ty: 0, dragging: false, lx: 0, ly: 0, source: null };
@@ -189,15 +184,7 @@ const sun = new THREE.DirectionalLight(0xffffff, 0.85);
 sun.position.set(40, 120, -30);
 scene.add(sun);
 
-/**
- * Vehicle → Three.js display frame.
- * Vehicle: +x right, +y forward, +z up.
- * Three: Y-up, ground on XZ. Remap (x,y,z)_veh → (-x, z, y)_three so that
- * when the default camera sits behind ego looking along +Z (= forward),
- * vehicle +x lands on screen-right — matching camera images.
- * (A plain (x,z,y) map flips L/R: Three lookAt(+Z) makes camera-right = −X.)
- * Cam projection still uses raw vehicle xyz (unchanged).
- */
+/** Vehicle +x right +y fwd +z up → Three (−x, z, y). */
 function vehToThree(x, y, z, out = new THREE.Vector3()) {
   return out.set(-x, z, y);
 }
@@ -515,10 +502,10 @@ async function loadStaticAggFromIndex() {
 
 function fineToCoarse(lab) {
   const i = lab | 0;
-  if (i < 0 || i >= 22) return "noise";
-  if (COARSE_DYNAMIC.has(i)) return "dynamic";
-  if (COARSE_FREESPACE.has(i)) return "freespace";
-  if (COARSE_STATIC.has(i)) return "static";
+  if (i < 0 || i >= nFine) return "noise";
+  if (Cdyn.has(i)) return "dynamic";
+  if (Cfree.has(i)) return "freespace";
+  if (Csta.has(i)) return "static";
   return "noise";
 }
 
@@ -612,7 +599,7 @@ function resolveClassColors(meta) {
 function colorFromLabel(label) {
   const mode = colorModeValue();
   if (mode === "coarse") {
-    const c = COARSE_COLORS[fineToCoarse(label)] || COARSE_COLORS.noise;
+    const c = Ccol[fineToCoarse(label)] || Ccol.noise;
     return new THREE.Color(c[0] / 255, c[1] / 255, c[2] / 255);
   }
   const i = label | 0;
@@ -624,14 +611,14 @@ function colorFromLabel(label) {
 }
 
 function colorFromLidar(lid) {
-  const c = LIDAR_COLORS[lid] || [160, 160, 160];
+  const c = Lcol[lid] || [160, 160, 160];
   return new THREE.Color(c[0] / 255, c[1] / 255, c[2] / 255);
 }
 
 function rgbCss(label) {
   const mode = colorModeValue();
   if (mode === "coarse") {
-    const c = COARSE_COLORS[fineToCoarse(label)] || COARSE_COLORS.noise;
+    const c = Ccol[fineToCoarse(label)] || Ccol.noise;
     return `rgb(${c[0]},${c[1]},${c[2]})`;
   }
   const i = label | 0;
@@ -643,7 +630,7 @@ function rgbCss(label) {
 }
 
 function rgbCssLidar(lid) {
-  const c = LIDAR_COLORS[lid] || [160, 160, 160];
+  const c = Lcol[lid] || [160, 160, 160];
   return `rgb(${c[0]},${c[1]},${c[2]})`;
 }
 
@@ -658,8 +645,8 @@ function renderClassLegend() {
   if (!el.classLegend) return;
   const mode = colorModeValue();
   if (mode === "coarse") {
-    el.classLegend.innerHTML = COARSE_ORDER.map((name) => {
-      const c = COARSE_COLORS[name];
+    el.classLegend.innerHTML = Cord.map((name) => {
+      const c = Ccol[name];
       return `<div class="legend-item" title="${name}">
         <i class="legend-swatch" style="background:rgb(${c[0]},${c[1]},${c[2]})"></i>
         <span>${name}</span>
@@ -670,7 +657,7 @@ function renderClassLegend() {
   if (mode === "lidar") {
     el.classLegend.innerHTML = [1, 2, 14]
       .map((lid) => {
-        const c = LIDAR_COLORS[lid];
+        const c = Lcol[lid];
         return `<div class="legend-item" title="lidar_${lid}">
           <i class="legend-swatch" style="background:rgb(${c[0]},${c[1]},${c[2]})"></i>
           <span>lidar_${lid}</span>
@@ -1559,7 +1546,7 @@ async function loadFrame(frameEntry) {
       // Keep frame dynamic only — static comes from clip static_agg + ego_pose.
       const dynIdx = [];
       for (let i = 0; i < rawLab.length; i++) {
-        if (FINE_DYNAMIC.has(rawLab[i] | 0)) dynIdx.push(i);
+        if (Cdyn.has(rawLab[i] | 0)) dynIdx.push(i);
       }
       frameDynXYZ = new Float32Array(dynIdx.length * 3);
       frameDynLab = new Uint8Array(dynIdx.length);
@@ -1746,7 +1733,7 @@ async function loadClip(clipId) {
 }
 
 async function boot() {
-  // discover clips
+  applyProfile(await fetchJson("/api/config"));
   try {
     const cat = await fetchJson("/api/clips");
     clipsCatalog = cat.clips || [];
@@ -1982,15 +1969,15 @@ if (el.btnApplyRoi) {
 }
 if (el.btnResetRoi) {
   el.btnResetRoi.addEventListener("click", () => {
-    el.roiX0.value = -24;
-    el.roiX1.value = 24;
-    el.roiY0.value = -25;
-    el.roiY1.value = 150;
-    el.roiZ0.value = -5;
-    el.roiZ1.value = 3;
+    el.roiX0.value = roi.x0;
+    el.roiX1.value = roi.x1;
+    el.roiY0.value = roi.y0;
+    el.roiY1.value = roi.y1;
+    el.roiZ0.value = roi.z0;
+    el.roiZ1.value = roi.z1;
     readRoiFromInputs();
     rebuildColoredViews();
-    setStatus("ROI reset to default [-24,24]×[-25,150]×[-5,3]");
+    setStatus(`ROI reset to default [${roi.x0},${roi.x1}]×[${roi.y0},${roi.y1}]×[${roi.z0},${roi.z1}]`);
   });
 }
 if (el.togRoiBox) {

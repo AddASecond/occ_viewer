@@ -13,10 +13,6 @@ import numpy as np
 _VIEW = Path(__file__).resolve().parent
 if str(_VIEW) not in sys.path:
     sys.path.insert(0, str(_VIEW))
-
-from env_paths import ensure_c_path
-
-ensure_c_path()
 import occ_render as occmod
 
 
@@ -155,11 +151,7 @@ def overlay_occ_squares(
     y_range: tuple[float, float] | None = None,
     z_range: tuple[float, float] | None = None,
 ) -> np.ndarray:
-    """Project each occupied voxel cube (8 corners → convex hull) onto the image.
-
-    Matches tools/occ_viewer/app.js projectOccCubes (cull behind-cam / wings /
-    oversized silhouettes; rectangular FOV only — no circular r² mask).
-    """
+    """Voxel cube (8 corners → hull) onto image; same culls as web/app.js projectOccCubes."""
     if ijk is None or x_range is None or y_range is None or z_range is None:
         return image_bgr
 
@@ -487,7 +479,7 @@ def export_scene_video(
             )
             cam_panels.append(fit_panel(img, tile_w, tile_h))
 
-        bev = occ_render.render_occ_bev(
+        bev = occmod.render_occ_bev(
             grid,
             colors_bgr=colors_bgr,
             target_w=max(tile_w * 5, 2400),
@@ -536,7 +528,11 @@ def export_scene_video(
         "fps": fps,
         "n_frames": len(frames),
         "path": str(out_path),
-        "relpath": str(out_path.relative_to(scene_dir)),
+        "relpath": (
+            str(out_path.relative_to(scene_dir))
+            if out_path.resolve().is_relative_to(scene_dir.resolve())
+            else out_path.name
+        ),
         "elapsed_sec": round(elapsed, 2),
         "occ_voxel": index.get("occ_voxel"),
     }

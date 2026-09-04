@@ -1,0 +1,7 @@
+format: robotruck
+host: 127.0.0.1
+port: 8765
+python:
+  - .venv/bin/python
+  - /home/dev/01develop/LitePT/.venv_smoke/bin/python
+  - /home/dev/01develop/LitePT/.venv/bin/python

@@ -25,14 +25,19 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-ROOT = Path(__file__).resolve().parent  # standalone project root
-VIEWER_DIR = ROOT
-EXPORT_SCRIPT = VIEWER_DIR / "scene_video.py"
+import yaml
 
-# C5: prefer in-process export API when importable.
+ROOT = Path(__file__).resolve().parent
+WEB = ROOT / "web"
+SRC = ROOT / "src"
+EXPORT_SCRIPT = SRC / "scene_video.py"
+CFG = yaml.safe_load((ROOT / "config" / "viewer.yaml").read_text()) or {}
+FMT = yaml.safe_load(
+    (ROOT / "config" / "formats" / f"{CFG.get('format', 'robotruck')}.yaml").read_text()
+) or {}
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
 try:
-    if str(VIEWER_DIR) not in sys.path:
-        sys.path.insert(0, str(VIEWER_DIR))
     import scene_video as _scene_video_mod
 except Exception:
     _scene_video_mod = None
@@ -77,14 +82,12 @@ JOB = VideoJob()
 
 
 def _python_bin() -> str:
-    for cand in (
-        ROOT / ".venv" / "bin" / "python",
-        Path("/home/dev/01develop/LitePT/.venv_smoke/bin/python"),
-        Path("/home/dev/01develop/LitePT/.venv/bin/python"),
-        Path(sys.executable),
-    ):
-        if Path(cand).is_file():
-            return str(cand)
+    for cand in CFG.get("python") or []:
+        p = Path(cand)
+        if not p.is_absolute():
+            p = ROOT / p
+        if p.is_file():
+            return str(p)
     return sys.executable
 
 
@@ -248,7 +251,7 @@ class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, clips: dict[str, Path], default_clip: str, **kwargs):
         self.clips = clips
         self.default_clip = default_clip
-        super().__init__(*args, directory=str(VIEWER_DIR), **kwargs)
+        super().__init__(*args, directory=str(WEB), **kwargs)
 
     def _scene(self, clip_id: str | None = None) -> Path | None:
         cid = clip_id or self.default_clip
@@ -307,6 +310,10 @@ class Handler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = unquote(parsed.path)
         qs = parse_qs(parsed.query)
+
+        if path == "/api/config":
+            self._send_json(FMT)
+            return
 
         if path == "/api/clips":
             items = [clip_info(cid, p) for cid, p in self.clips.items()]
@@ -393,16 +400,16 @@ class Handler(SimpleHTTPRequestHandler):
         if p.startswith("/scenes/"):
             rest = p[len("/scenes/") :]
             if not rest:
-                return str(VIEWER_DIR / "index.html")
+                return str(WEB / "index.html")
             parts = rest.split("/", 1)
             clip_id = parts[0]
             rel = parts[1] if len(parts) > 1 else ""
             scene = self._scene(clip_id)
             if scene is None:
-                return str(VIEWER_DIR / "index.html")
+                return str(WEB / "index.html")
             target = (scene / rel).resolve() if rel else scene
             if not str(target).startswith(str(scene)):
-                return str(VIEWER_DIR / "index.html")
+                return str(WEB / "index.html")
             return str(target)
 
         # /scene/... → default clip (backward compatible)
@@ -410,10 +417,10 @@ class Handler(SimpleHTTPRequestHandler):
             rel = p[len("/scene/") :] if p.startswith("/scene/") else ""
             scene = self._scene(self.default_clip)
             if scene is None:
-                return str(VIEWER_DIR / "index.html")
+                return str(WEB / "index.html")
             target = (scene / rel).resolve() if rel else scene
             if not str(target).startswith(str(scene)):
-                return str(VIEWER_DIR / "index.html")
+                return str(WEB / "index.html")
             return str(target)
 
         return super().translate_path(path)
@@ -441,8 +448,8 @@ def main() -> int:
         default="",
         help="Single scene root (compat). If set with --scenes-root, becomes default clip.",
     )
-    ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--host", default=str(CFG.get("host") or "127.0.0.1"))
+    ap.add_argument("--port", type=int, default=int(CFG.get("port") or 8765))
     args = ap.parse_args()
 
     clips: dict[str, Path] = {}

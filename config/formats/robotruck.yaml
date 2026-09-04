@@ -1,0 +1,48 @@
+id: robotruck
+schema_version: robotruck_occ_scene/v1
+# Canonical viewer package: index.json + assets.*.uri (see docs/SCHEMA.md).
+# Mongo is declared for ingest / next backends; this viewer does not connect.
+mongo:
+  uri_env: ROBOTRUCK_MONGO_URI
+  uri_default: mongodb://krk030-mongodb:27017/?authSource=perception_experiment
+  db: perception_experiment
+  clip_collection_prefix: occ_data_clips_
+  frame_collection_prefix: occ_data_frames_
+disk:
+  raw_roots:
+    - /data/rawdata
+    - /data/rawdata-1
+    - /data/rawdata-2
+    - /data/rawdata-3
+    - /data/rawdata-4
+  occ_root: /data/rawdata-3/occ
+  occ_frame_layout: lidar/{a}/{b}/{c}/
+  occ_clip_layout: clips/{a}/{b}/{c}/
+scene:
+  index_file: index.json
+  occupancy_keys: [ijk, labels, centers, counts]
+  relative_prefixes: [frames/, static_agg/]
+roi:
+  x: [-24.0, 24.0]
+  y: [-25.0, 150.0]
+  z: [-5.0, 3.0]
+voxel: 0.2
+taxonomy:
+  fine:
+    n: 22
+  coarse:
+    order: [dynamic, static, freespace, noise]
+    colors_rgb:
+      dynamic: [230, 64, 64]
+      static: [64, 160, 255]
+      freespace: [72, 200, 96]
+      noise: [160, 160, 160]
+    fine_ids:
+      dynamic: [0, 1, 2, 3, 4, 5, 6, 11, 12]
+      static: [7, 8, 9, 10, 13, 14, 15, 16]
+      freespace: [17, 18, 19, 20, 21]
+  lidar_ids:
+    colors_rgb:
+      1: [40, 180, 255]
+      2: [40, 220, 40]
+      14: [255, 40, 40]

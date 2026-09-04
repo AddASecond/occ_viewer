@@ -6,3 +6,5 @@ videos/
 job_*.json
 job_*.log
 .DS_Store
+preview_export.mp4
+*.mp4

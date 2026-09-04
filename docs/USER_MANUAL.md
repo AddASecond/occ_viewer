@@ -1,7 +1,7 @@
 # Robotruck Occ Viewer — 操作手册
 
-> 版本对应前端：`tools/occ_viewer`（`app.js?v=occ-fix-14` 及之后）  
-> 数据约定详见同目录 [SCHEMA.md](./SCHEMA.md)  
+> 版本对应前端：`web/app.js`（`app.js?v=occ-fix-29` 及之后）  
+> 数据约定见 [SCHEMA.md](./SCHEMA.md)；Robotruck Mongo 见 [formats/robotruck_mongo.md](./formats/robotruck_mongo.md)  
 > 适用对象：需要查看 Robotruck occupancy / 点云 / 多相机投影、并导出对照视频的同事
 
 ---
@@ -68,32 +68,23 @@ exp/robotruck/occ_scenes/
     ...
 ```
 
-若还没有场景包，先用导出脚本（示例）：
-
-```bash
-cd /home/dev/01develop/occ_viewer
-export PYTHONPATH=./
-.venv_smoke/bin/python tools/occ/export_scene.py \
-  --clip stop_1784423032302844849_vehicle-V002-20260719_090818 \
-  --stride 1 --reuse-pred --occ-voxel 0.2 \
-  --export-points --aggregate-static
-```
+若还没有场景包，用各自格式的导出器生成符合 [SCHEMA.md](./SCHEMA.md) 的目录。
 
 ### 2.2 启动服务
 
 **推荐（多 clip）：**
 
 ```bash
-.venv_smoke/bin/python serve.py \
-  --scenes-root exp/robotruck/occ_scenes \
+python serve.py \
+  --scenes-root /path/to/occ_scenes \
   --host 0.0.0.0 --port 8765
 ```
 
 **单 clip（兼容）：**
 
 ```bash
-.venv_smoke/bin/python serve.py \
-  --scene exp/robotruck/occ_scenes/stop_... \
+python serve.py \
+  --scene /path/to/occ_scenes/<clip> \
   --host 0.0.0.0 --port 8765
 ```
 
@@ -537,8 +528,9 @@ flowchart TB
 | 文件 | 内容 |
 |------|------|
 | 本手册 `USER_MANUAL.md` | 操作与概念 |
-| `SCHEMA.md` | 场景包字段级约定 |
+| `docs/SCHEMA.md` | 规范 scene 包 |
 | `serve.py` | 启动与 API |
-| `app.js` / `index.html` | 前端实现 |
+| `web/app.js` / `web/index.html` | 前端 |
+| `config/formats/*.yaml` | 格式 profile |
 
 若 UI 大改，请同步更新本手册中的布局图、控件表与 `app.js?v=` 版本说明。

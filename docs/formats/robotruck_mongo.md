@@ -3,7 +3,7 @@
 > 原则：与 GSS 一致——**元数据进 Mongo，大文件进数据盘**；  
 > Occ 使用**独立命名空间**，且 **Mongo 表名 / 磁盘目录与原始 `raw_data_*` 层级一一对应**。
 
-相关前端约定见 [SCHEMA.md](./SCHEMA.md)（`assets.*.uri` 仍用相对或绝对 URI，ingest 时改写）。
+相关前端约定见 [SCHEMA.md](../SCHEMA.md)（`assets.*.uri` 仍用相对或绝对 URI，ingest 时改写）。配置见 `config/formats/robotruck.yaml`。
 
 ---
 
@@ -328,7 +328,7 @@ Matrix 服务端（专人）内网读文件或签 URL
   → Matrix 用 bagName + 纳秒起止时间（或 frame md5 列表）
   → 查询 occ_data_frames_<suffix>
   → 拉 occ bin + 原始 camera jpg
-  → 三维 Occ / 多相机投影（可复用 tools/occ_viewer 契约）
+  → 三维 Occ / 多相机投影（可复用 occ_viewer 规范 scene 契约）
 ```
 
 ### 10.2 推荐关联键（Claymore ↔ Mongo Occ）
@@ -402,7 +402,7 @@ GSS 已描述「用户自定义脚本的真值可视化」。Occ 建议走同一
 
 可选落地方式（Matrix 选一，本侧都兼容）：
 
-1. **嵌入式 Viewer**：Matrix 前端 iframe / 微前端加载与 `tools/occ_viewer` 同契约的静态页，`sceneBase` 指到 Matrix 签发的 asset URL。  
+1. **嵌入式 Viewer**：Matrix 前端 iframe / 微前端加载与 occ_viewer 同契约的静态页，`sceneBase` 指到 Matrix 签发的 asset URL。  
 2. **服务端出图**：Matrix 调内部 worker，按帧渲 BEV/投影图，走类似 RoadSense `/media` 的 preview。  
 3. **自定义 GT 脚本**：平台注册「LitePT Occ」可视化脚本，入参为 `md5`/`bagName`+时间窗，读本数据源。
 

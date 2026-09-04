@@ -1,43 +1,24 @@
-# Robotruck Occ Viewer — Scene Package Schema (`robotruck_occ_scene/v1`)
+# Occ Viewer — canonical scene package
 
-> 操作说明（启动、UI、投影、导出、排错）见同目录 **[USER_MANUAL.md](./USER_MANUAL.md)**。  
-> **GSS / Mongo 落库（专用 occdata + 与 raw_data 表/目录对齐）**见 **[GSS_OCC_STORAGE.md](./GSS_OCC_STORAGE.md)**。
+> UI / export: [USER_MANUAL.md](./USER_MANUAL.md).  
+> Robotruck Mongo / disk: [formats/robotruck_mongo.md](./formats/robotruck_mongo.md) and `config/formats/robotruck.yaml`.
 
-本格式是前端 `tools/occ_viewer` 的唯一输入约定。路径全部相对 **scene 根目录**（或将来 Mongo/GridFS/S3 上的逻辑前缀），**不绑定本机绝对路径**；落库时只需把 `uri` 改写成对象存储 key / GridFS id，前端用同一字段解析。
+The viewer **only** consumes this package (relative `uri`s under a scene root). Other occupancy formats (AD / embodied) should export or map into this shape; swap `config/viewer.yaml` `format:` and add `config/formats/<name>.yaml`.
 
 ---
 
-## 1. 包目录（文件系统落地时）
+## 1. Package layout (filesystem)
 
 ```text
 <scene_root>/
-  index.json                 # scene 清单（可作 Mongo scene 文档）
-  SCHEMA.md                  # 可选：本说明副本
-  frames/
-    <timestamp>/
-      meta.json              # frame 文档（可作 Mongo frame 文档）
-      occ_ijk.i32.bin
-      occ_labels.u8.bin
-      occ_centers.f32.bin
-      occ_counts.i32.bin
-      points_xyz.f32.bin     # 可选
-      points_labels.u8.bin
-      points_lidar_id.u8.bin
-      cameras/
-        camera1.jpg
-        ...
+  index.json
+  frames/<frame_id>/meta.json
+  frames/<frame_id>/… occupancy / points binaries …
+  frames/<frame_id>/cameras/<name>.jpg
+  static_agg/                 # optional clip-level
 ```
 
-Mongo / GSS 落库（**推荐，与 raw 对齐**）见 [GSS_OCC_STORAGE.md](./GSS_OCC_STORAGE.md)：
-
-| 层 | 约定 |
-|----|------|
-| DB | `perception_experiment` |
-| 表 | `occ_data_clips_<suffix>` / `occ_data_frames_<suffix>` ↔ `raw_data_*_<suffix>` |
-| 盘 | **原始**在 RTGPU 卷 `h200-data-krk030-rawdata` → `/data/rawdata/{lidar,camera}/`；**Occ** 建议写有空闲的扩展卷，如 `/data/rawdata-3/occ/...`（需 `rtgpu volume attach`，见 [GSS_OCC_STORAGE.md](./GSS_OCC_STORAGE.md) §3） |
-| 盘 | Clip 级：`/data/rawdata-3/occ/clips/{a}/{b}/{c}/static_agg/` |
-
-本地预览仍可用下文「包目录」；ingest 时按 frame/clip **md5** 映射到 `occdata` 分片路径。
+Asset `uri`s are relative to the scene root (or absolute `https:` / `s3:` / `gridfs:`). Binary names are conventional; the viewer follows `assets.*.uri` in meta.
 
 ---
 
@@ -192,19 +173,12 @@ Mongo / GSS 落库（**推荐，与 raw 对齐**）见 [GSS_OCC_STORAGE.md](./GS
 本地预览：
 
 ```bash
-.venv_smoke/bin/python serve.py \
-  --scene <scene_root> --host 0.0.0.0 --port 8765
-# http://127.0.0.1:8765/?scene=/scene
+python serve.py --scene <scene_root> --host 0.0.0.0 --port 8765
 ```
 
 ---
 
-## 5. 生产命令示例
+## 5. Format profiles
 
-```bash
-export PYTHONPATH=./
-.venv_smoke/bin/python tools/occ/export_scene.py \
-  --clip stop_1784423032302844849_vehicle-V002-20260719_090818 \
-  --stride 2 --max-frames 2 --reuse-pred --occ-voxel 0.2 \
-  --export-points --max-export-points 200000 --aggregate-static
-```
+Robotruck Mongo / disk / taxonomy: `config/formats/robotruck.yaml`.  
+Active format: `config/viewer.yaml` (`format:`).

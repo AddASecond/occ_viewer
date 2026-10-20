@@ -16,11 +16,14 @@ from __future__ import annotations
 import argparse
 import functools
 import json
+import math
 import subprocess
 import sys
 import threading
 import time
 import uuid
+import urllib.error
+import urllib.request
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
@@ -30,6 +33,118 @@ import yaml
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web"
 SRC = ROOT / "src"
+SRC_CLIPS = Path("/data/rawdata-4/annotation_delivery_938_1hz_v3_20260929/clips")
+CAMERA_VOLUMES = (
+    Path("/data/rawdata-4"),
+    Path("/data/rawdata"),
+    Path("/data/rawdata-2"),
+    Path("/data/rawdata-3"),
+)
+_FRAME_INDEX: dict[str, dict[str, dict]] = {}
+# Clip discovery is consulted by every static-file request; throttle the scan.
+_CLIP_SCAN_TTL = 2.0
+_CLIP_SCAN_LOCK = threading.Lock()
+_CLIP_SCAN = {"at": 0.0, "root": None, "found": {}}
+
+
+def find_camera_jpg(md5: str) -> Path | None:
+    if not md5 or len(md5) < 5:
+        return None
+    for volume in CAMERA_VOLUMES:
+        path = volume / "camera" / md5[:2] / md5[2:4] / (md5[4:] + ".jpg")
+        if path.is_file():
+            return path
+    return None
+
+
+def lookup_source_camera(clip_id: str, frame_ts: str, cam: str) -> Path | None:
+    frames = _FRAME_INDEX.get(clip_id)
+    if frames is None:
+        frames = {}
+        src = SRC_CLIPS / clip_id / "frames.jsonl"
+        if src.is_file():
+            for line in src.read_text().splitlines():
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                frames[str(row.get("timestamp_ns"))] = row
+        _FRAME_INDEX[clip_id] = frames
+    row = frames.get(str(frame_ts))
+    if not row:
+        return None
+    info = (row.get("cameras") or {}).get(cam)
+    if not info:
+        return None
+    return find_camera_jpg(info.get("md5") or "")
+
+
+PREVIEW_MAX_POINTS = 800_000
+
+
+def _write_strided_preview(src: Path, dst: Path, count: int, itemsize: int, step: int) -> bool:
+    """Keep every step-th record; numpy memmap keeps this O(bytes) with low RAM."""
+    try:
+        import numpy as np
+    except Exception:
+        return False
+    count = min(count, src.stat().st_size // itemsize)
+    kept = count // step
+    if kept <= 0:
+        return False
+    tmp = dst.with_name(dst.name + ".tmp")
+    try:
+        mm = np.memmap(src, dtype=np.uint8, mode="r", shape=(count, itemsize))
+        mm[::step][:kept].tofile(tmp)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        return False
+    tmp.replace(dst)
+    return True
+
+
+def ensure_point_preview(scene: Path) -> None:
+    agg = scene / "point_agg"
+    mapping = (("xyz.f32.bin", 12), ("labels.u8.bin", 1), ("lidar_id.u8.bin", 1))
+    # Cheap stats first; only parse index.json when a preview must be rebuilt.
+    pending = []
+    for name, itemsize in mapping:
+        src = agg / name
+        dst = agg / f"preview_{name}"
+        if not src.is_file():
+            continue
+        sstat = src.stat()
+        if dst.is_file() and dst.stat().st_mtime >= sstat.st_mtime and dst.stat().st_size > 0:
+            continue
+        pending.append((itemsize, src, dst, sstat))
+    if not pending:
+        return
+    n = 0
+    idx_path = scene / "index.json"
+    if idx_path.is_file():
+        try:
+            n = int((json.loads(idx_path.read_text()).get("point_aggregate") or {}).get("n") or 0)
+        except Exception:
+            n = 0
+    for itemsize, src, dst, sstat in pending:
+        count = n or (sstat.st_size // itemsize)
+        if count <= 0:
+            continue
+        step = max(1, math.ceil(count / PREVIEW_MAX_POINTS))
+        if _write_strided_preview(src, dst, count, itemsize, step):
+            continue
+        # Fallback: record-at-a-time, no numpy needed.
+        kept = count // step
+        tmp = dst.with_name(dst.name + ".tmp")
+        with src.open("rb") as reader, tmp.open("wb") as writer:
+            for i in range(kept):
+                reader.seek(i * step * itemsize)
+                chunk = reader.read(itemsize)
+                if len(chunk) < itemsize:
+                    break
+                writer.write(chunk)
+        tmp.replace(dst)
+
+
 EXPORT_SCRIPT = SRC / "scene_video.py"
 CFG = yaml.safe_load((ROOT / "config" / "viewer.yaml").read_text()) or {}
 FMT = yaml.safe_load(
@@ -248,12 +363,32 @@ def _run_export(scene_dir: Path, clip_id: str, params: dict) -> None:
 
 
 class Handler(SimpleHTTPRequestHandler):
-    def __init__(self, *args, clips: dict[str, Path], default_clip: str, **kwargs):
+    def __init__(self, *args, clips: dict[str, Path], default_clip: str, scenes_root: Path | None = None, **kwargs):
         self.clips = clips
         self.default_clip = default_clip
+        self.scenes_root = scenes_root
         super().__init__(*args, directory=str(WEB), **kwargs)
 
+    def _refresh_clips(self) -> None:
+        if self.scenes_root is None:
+            return
+        now = time.monotonic()
+        with _CLIP_SCAN_LOCK:
+            if (
+                _CLIP_SCAN["root"] != self.scenes_root
+                or now - _CLIP_SCAN["at"] >= _CLIP_SCAN_TTL
+            ):
+                _CLIP_SCAN["root"] = self.scenes_root
+                _CLIP_SCAN["found"] = discover_clips(self.scenes_root)
+                _CLIP_SCAN["at"] = now
+            found = _CLIP_SCAN["found"]
+        if found:
+            self.clips.update(found)
+            if self.default_clip not in self.clips:
+                self.default_clip = next(iter(self.clips))
+
     def _scene(self, clip_id: str | None = None) -> Path | None:
+        self._refresh_clips()
         cid = clip_id or self.default_clip
         return self.clips.get(cid)
 
@@ -306,16 +441,53 @@ class Handler(SimpleHTTPRequestHandler):
             return
         self.send_error(404)
 
+    def _proxy_review(self, path: str, query: str) -> None:
+        rest = path[len("/gallery"):] or "/"
+        if not rest.startswith("/"):
+            rest = "/" + rest
+        url = f"http://127.0.0.1:8738{rest}"
+        if query:
+            url += "?" + query
+        req = urllib.request.Request(url, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                self.send_response(resp.status)
+                ctype = resp.headers.get("Content-Type") or "application/octet-stream"
+                self.send_header("Content-Type", ctype)
+                cl = resp.headers.get("Content-Length")
+                if cl:
+                    self.send_header("Content-Length", cl)
+                self.end_headers()
+                while True:
+                    chunk = resp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        except urllib.error.HTTPError as exc:
+            body = exc.read()
+            self.send_response(exc.code)
+            self.send_header("Content-Type", exc.headers.get("Content-Type") or "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as exc:
+            self._send_json({"error": f"review proxy: {exc}"}, 502)
+
     def do_GET(self):
         parsed = urlparse(self.path)
         path = unquote(parsed.path)
         qs = parse_qs(parsed.query)
+
+        if path == "/gallery" or path.startswith("/gallery/"):
+            self._proxy_review(path, parsed.query)
+            return
 
         if path == "/api/config":
             self._send_json(FMT)
             return
 
         if path == "/api/clips":
+            self._refresh_clips()
             items = [clip_info(cid, p) for cid, p in self.clips.items()]
             self._send_json(
                 {
@@ -408,8 +580,22 @@ class Handler(SimpleHTTPRequestHandler):
             if scene is None:
                 return str(WEB / "index.html")
             target = (scene / rel).resolve() if rel else scene
-            if not str(target).startswith(str(scene)):
+            if rel and not str(target).startswith(str(scene)):
                 return str(WEB / "index.html")
+            if rel.startswith("point_agg/preview_"):
+                ensure_point_preview(scene)
+                target = (scene / rel).resolve()
+            if rel and not target.is_file():
+                parts_rel = rel.split("/")
+                if (
+                    len(parts_rel) == 4
+                    and parts_rel[0] == "frames"
+                    and parts_rel[2] == "cameras"
+                    and parts_rel[3].endswith(".jpg")
+                ):
+                    found = lookup_source_camera(clip_id, parts_rel[1], parts_rel[3][:-4])
+                    if found is not None:
+                        return str(found)
             return str(target)
 
         # /scene/... → default clip (backward compatible)
@@ -467,7 +653,10 @@ def main() -> int:
     if default_clip not in clips:
         default_clip = next(iter(clips))
 
-    handler = functools.partial(Handler, clips=clips, default_clip=default_clip)
+    scenes_root = Path(args.scenes_root).resolve() if args.scenes_root else None
+    handler = functools.partial(
+        Handler, clips=clips, default_clip=default_clip, scenes_root=scenes_root
+    )
     httpd = ThreadingHTTPServer((args.host, args.port), handler)
     url = f"http://{args.host}:{args.port}/"
     print(f"clips ({len(clips)}): {', '.join(clips)}")

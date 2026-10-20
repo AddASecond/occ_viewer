@@ -55,6 +55,23 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 浏览器打开打印出的 URL（默认 `http://127.0.0.1:8765/`）。命令行 `--host` / `--port` 会覆盖 YAML 默认值。
 
+## GSS / MongoDB 接入
+
+GSS 挂载本仓库的 `web/`（`ME_CONFIG_OCC_VIEWER_WEB_ROOT`），无需复制源码或启动 `serve.py`。
+打开 `/occ-viewer/index.html?source=gss`，在现有 viewer 顶部选择数据库集合、搜索、分页及筛选 train/val。
+默认只加载当前帧，OCC 以全部体素中心点显示，相机直接显示 RGB；立方体、投影和整段 Clip aggregate 均可按需切换。
+左侧加载详情分别显示相机、OCC 和点云的进度及错误；文件并行读取，单个请求 45 秒超时，可点“重试加载”。切帧会取消旧请求，已加载的同场景聚合点云在内存中复用。
+GSS 原数据库页面继续用于文档浏览；`web/gss.js` 只负责目录选择，Mongo 查询和资产读取在 GSS 维护。
+
+同源只读接口：
+- `../api/occ/datasets` → `{datasets: [{database, collection, url}]}`，覆盖全部授权数据库。
+- `<dataset.url>?search=&offset=0&tag=train` → `{clips: [{id, clip_id, n_frames, url}], total, next_offset}`；`tag` 可省略。
+- `<clip.url>/index.json`、index 中的 `meta_uri` 和 `assets.*.uri` 遵循 [SCHEMA.md](docs/SCHEMA.md)。
+
+场景 URL 保存在地址栏，可直接分享。`?source=external&scene=<scene URL>` 也可打开单个同源场景。
+外部模式从 scene index 读取 taxonomy/defaults，缺失字段使用 viewer 默认值，不维护第二份 profile。
+外部模式不调用本地视频接口；普通 `serve.py` 模式保留原功能。
+
 ## 配置自定义
 
 配置分两层，改完后**重启** `serve.py`（前端在 `boot()` 时 `GET /api/config` 拉 active format）。

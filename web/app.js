@@ -1,9 +1,31 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 
+if (location.pathname === "/occ") {
+  location.replace("/occ/" + location.search + location.hash);
+}
 const qs = new URLSearchParams(location.search);
+// External scene providers implement the canonical scene contract. They own
+// authentication and data access; this viewer remains independent of MongoDB.
+const mongoSource = qs.get("source") === "gss";
+const externalSource = mongoSource || qs.get("source") === "external";
+const OCC_BASE = (location.pathname === "/occ" || location.pathname.startsWith("/occ/")) ? "/occ" : "";
+function occUrl(path) {
+  if (!path) return path;
+  if (/^(https?:|data:|blob:)/i.test(path)) return path;
+  if (OCC_BASE && path.startsWith("/") && !path.startsWith(`${OCC_BASE}/`) && path !== OCC_BASE) {
+    return OCC_BASE + path;
+  }
+  return path;
+}
+function clipIdFromScene(root) {
+  if (!root) return "";
+  const raw = String(root).replace(/\/$/, "");
+  const m = raw.match(/(?:^|\/)scenes\/([^/?#]+)/);
+  return m ? m[1] : raw.replace(/^\/occ/, "").replace(/^\/scene\/?/, "").replace(/^\//, "");
+}
 /** Active scene HTTP prefix, e.g. /scenes/<clip_id> or /scene */
-let sceneRoot = (qs.get("scene") || "").replace(/\/$/, "");
+let sceneRoot = occUrl((qs.get("scene") || "").replace(/\/$/, ""));
 let clipsCatalog = [];
 let frameIndex = 0;
 let currentOccVariant = "litept";
@@ -12,7 +34,7 @@ let currentOccVariant = "litept";
 function assetUrl(uri, frameRelFallback = null) {
   if (!uri) return null;
   if (/^(https?:|data:|blob:|gridfs:|s3:)/i.test(uri)) return uri;
-  if (uri.startsWith("/")) return uri;
+  if (uri.startsWith("/")) return occUrl(uri);
   // scene-root relative (v1)
   if (uri.startsWith("frames/")) return `${sceneRoot}/${uri}`;
   // legacy: relative to frame dir
@@ -47,6 +69,23 @@ function camImageUrl(cam) {
   return null;
 }
 
+function camSize(cam, img) {
+  const w = Number(cam.width || (cam.image && cam.image.width) || (img && img.naturalWidth) || 1920);
+  const h = Number(cam.height || (cam.image && cam.image.height) || (img && img.naturalHeight) || 1080);
+  return { w, h };
+}
+
+function useClipAggregate() {
+  return !el.ptSource || el.ptSource.value === "clip_agg";
+}
+
+function egoPoseRecord(ego) {
+  if (!ego) return null;
+  if (ego.pose && ego.pose.position && ego.pose.orientation) return ego.pose;
+  if (ego.position && ego.orientation) return ego;
+  return null;
+}
+
 const el = {
   frameSelect: document.getElementById("frameSelect"),
   clipSelect: document.getElementById("clipSelect"),
@@ -59,7 +98,9 @@ const el = {
   status: document.getElementById("status"),
   cams: document.getElementById("cams"),
   togOcc: document.getElementById("togOcc"),
+  occStyle: document.getElementById("occStyle"),
   togPts: document.getElementById("togPts"),
+  ptSource: document.getElementById("ptSource"),
   togOdBoxes: document.getElementById("togOdBoxes"),
   togGrid: document.getElementById("togGrid"),
   togAxes: document.getElementById("togAxes"),
@@ -87,11 +128,17 @@ const el = {
   classLegend: document.getElementById("classLegend"),
   colorMode: document.getElementById("colorMode"),
   coarseToggles: document.getElementById("coarseToggles"),
+  coarse5Toggles: document.getElementById("coarse5Toggles"),
   lidarToggles: document.getElementById("lidarToggles"),
   togDyn: document.getElementById("togDyn"),
   togSta: document.getElementById("togSta"),
   togFree: document.getElementById("togFree"),
   togNoise: document.getElementById("togNoise"),
+  togC5Dyn: document.getElementById("togC5Dyn"),
+  togC5Sta: document.getElementById("togC5Sta"),
+  togC5Noise: document.getElementById("togC5Noise"),
+  togC5Drv: document.getElementById("togC5Drv"),
+  togC5Ndrv: document.getElementById("togC5Ndrv"),
   togLid1: document.getElementById("togLid1"),
   togLid2: document.getElementById("togLid2"),
   togLid14: document.getElementById("togLid14"),
@@ -149,34 +196,75 @@ let framePtLabels = null;
 let framePtLidar = null;
 /** Clip-level static in map frame (same points every frame; only pose changes). */
 let staticAgg = null;
+let clipAggFitted = false;
 let roiHelper = null;
 let roi = { x0: -24, x1: 24, y0: -25, y1: 150, z0: -5, z1: 3 };
-let Cdyn, Cfree, Csta, Ccol, Cord, Lcol, nFine;
+let Cdyn, Cfree, Csta, Ccol, Cord, nFine;
+let Lcol = { 1: [40, 180, 255], 2: [40, 220, 40], 14: [255, 40, 40] };
+let C5dyn, C5sta, C5drv, C5ndrv, C5col, C5ord;
+let labelEncoding = "fine22";
 
-function applyProfile(p) {
-  const c = p.taxonomy.coarse, L = p.taxonomy.lidar_ids;
-  Cdyn = new Set(c.fine_ids.dynamic);
-  Cfree = new Set(c.fine_ids.freespace);
-  Csta = new Set(c.fine_ids.static);
-  Ccol = c.colors_rgb;
-  Cord = c.order;
-  Lcol = Object.fromEntries(Object.entries(L.colors_rgb).map(([k, v]) => [+k, v]));
-  nFine = p.taxonomy.fine.n;
-  const r = p.roi;
+const C5_DEFAULT = {
+  order: ["dynamic", "static", "noise", "drivable", "non_drivable"],
+  colors_rgb: {
+    dynamic: [255, 51, 38],
+    static: [255, 158, 0],
+    noise: [115, 115, 115],
+    drivable: [51, 217, 77],
+    non_drivable: [64, 128, 255],
+  },
+  fine_ids: {
+    dynamic: [0, 1, 2, 3, 4, 5, 6, 11, 12],
+    static: [7, 8, 9, 10, 13, 14, 15, 16],
+    drivable: [17, 18],
+    non_drivable: [19, 20, 21],
+  },
+};
+
+function applyCoarse5(c5) {
+  const src = c5 || C5_DEFAULT;
+  C5dyn = new Set((src.fine_ids && src.fine_ids.dynamic) || C5_DEFAULT.fine_ids.dynamic);
+  C5sta = new Set((src.fine_ids && src.fine_ids.static) || C5_DEFAULT.fine_ids.static);
+  C5drv = new Set((src.fine_ids && src.fine_ids.drivable) || C5_DEFAULT.fine_ids.drivable);
+  C5ndrv = new Set((src.fine_ids && src.fine_ids.non_drivable) || C5_DEFAULT.fine_ids.non_drivable);
+  C5col = src.colors_rgb || C5_DEFAULT.colors_rgb;
+  C5ord = src.order || C5_DEFAULT.order;
+}
+
+function applyProfile(p = {}) {
+  // Both serve.py profiles and canonical scene indexes describe the taxonomy.
+  const t = p.taxonomy || {}, c = t.coarse || {}, L = t.lidar_ids || {};
+  Cord = c.order || c.names || ["dynamic", "static", "freespace", "noise"];
+  const ids = name => c.fine_ids?.[name] || c.fine_to_coarse?.flatMap((group, id) => Cord[group] === name ? [id] : []);
+  Cdyn = new Set(ids("dynamic") || C5_DEFAULT.fine_ids.dynamic);
+  Csta = new Set(ids("static") || C5_DEFAULT.fine_ids.static);
+  Cfree = new Set(ids("freespace") || [...C5_DEFAULT.fine_ids.drivable, ...C5_DEFAULT.fine_ids.non_drivable]);
+  Ccol = Array.isArray(c.colors_rgb) ? Object.fromEntries(Cord.map((name, i) => [name, c.colors_rgb[i]]))
+    : c.colors_rgb || { dynamic: [230, 64, 64], static: [64, 160, 255], freespace: [72, 200, 96], noise: [160, 160, 160] };
+  Lcol = Array.isArray(L.colors_rgb) ? Object.fromEntries(L.ids.map((id, i) => [id, L.colors_rgb[i]]))
+    : L.colors_rgb || { 1: [40, 180, 255], 2: [40, 220, 40], 14: [255, 40, 40] };
+  nFine = t.fine?.n || 22;
+  applyCoarse5(t.coarse5);
+  const r = p.roi || p.defaults?.roi || { x: [-24, 24], y: [-25, 150], z: [-5, 3] };
   roi = { x0: r.x[0], x1: r.x[1], y0: r.y[0], y1: r.y[1], z0: r.z[0], z1: r.z[1] };
 }
 
 /** Lightbox state */
 let lb = { scale: 1, tx: 0, ty: 0, dragging: false, lx: 0, ly: 0, source: null };
 
-const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
-renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+const renderer = new THREE.WebGLRenderer({ antialias: false, alpha: false });
+renderer.setPixelRatio(1);
 renderer.setClearColor(0x0b0e13, 1);
 el.wrap.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 3000);
 const controls = new OrbitControls(camera, renderer.domElement);
+let renderPending = true;
+controls.addEventListener("change", () => { renderPending = true; });
+for (const event of ["input", "change", "click"]) {
+  document.addEventListener(event, () => { renderPending = true; });
+}
 controls.enableDamping = true;
 
 scene.add(new THREE.AmbientLight(0xffffff, 0.65));
@@ -233,6 +321,7 @@ function clearOdBoxes() {
 }
 
 function buildOdBoxes(meta) {
+  renderPending = true;
   clearOdBoxes();
   odBoxesGroup = new THREE.Group();
   const objects = (meta.od_boxes && meta.od_boxes.objects) || [];
@@ -290,29 +379,110 @@ function buildAxes() {
 buildAxes();
 
 function resize() {
+  renderPending = true;
   const w = el.wrap.clientWidth;
   const h = el.wrap.clientHeight;
   camera.aspect = w / Math.max(1, h);
   camera.updateProjectionMatrix();
   renderer.setSize(w, h, false);
 }
-window.addEventListener("resize", resize);
+new ResizeObserver(resize).observe(el.wrap);
 resize();
 
 function setStatus(msg) {
   el.status.textContent = msg || "";
 }
 
-async function fetchJson(url) {
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
-  return r.json();
+// One request lifecycle for a clip/frame. Switching cancels stale downloads.
+let loadController = new AbortController();
+let loadStarted = 0;
+let loadFinished = true;
+let loadElapsedMs = null;
+const loadStates = new Map();
+const loadProgress = document.getElementById("loadProgress");
+function showLoadProgress() {
+  loadProgress.textContent = [...loadStates].map(([name, state]) => `${name}: ${state}`).join("\n");
+  const elapsedMs = loadFinished ? loadElapsedMs : (performance.now() - loadStarted);
+  if (elapsedMs != null) loadProgress.textContent += `\n已用时 ${(elapsedMs / 1000).toFixed(0)} 秒`;
 }
-
-async function fetchBin(url) {
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
-  return r.arrayBuffer();
+setInterval(() => { if (!loadFinished) showLoadProgress(); }, 1000);
+function loadState(name, state, signal = loadController.signal) {
+  if (signal.aborted) return;
+  loadStates.set(name, state);
+  showLoadProgress();
+}
+function beginLoad(message) {
+  renderPending = true;
+  loadController.abort();
+  loadController = new AbortController();
+  loadStates.clear();
+  loadStarted = performance.now();
+  loadFinished = false;
+  loadElapsedMs = null;
+  setStatus(message);
+  clearOcc();
+  clearPoints();
+  clearOdBoxes();
+  currentMeta = null;
+  ptXYZ = ptLabels = ptLidar = null;
+  framePtXYZ = framePtLabels = framePtLidar = null;
+  exportedOcc = null;
+  occIjk = occLabels = occProjIjk = occProjLabels = occCenters = null;
+  el.cams.replaceChildren();
+  closeLightbox();
+  el.sceneInfo.textContent = "加载中…";
+  showLoadProgress();
+  return loadController.signal;
+}
+function loadFailure(error, signal = loadController.signal) {
+  if (signal.aborted) return;
+  console.error(error);
+  if (loadStarted) loadElapsedMs = performance.now() - loadStarted;
+  loadFinished = true;
+  loadState("加载", `失败：${error.message}`, signal);
+  setStatus(`加载失败：${error.message} · 点击重试`);
+}
+async function fetchResource(url, type, signal) {
+  if (!url) throw new Error("缺少文件地址");
+  const timeout = AbortSignal.timeout(300000);
+  try {
+    const response = await fetch(url, { signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
+    if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`);
+    if (response.headers.get("content-type")?.includes("text/html")) {
+      throw new Error("返回了网页而非数据，请检查登录或数据权限");
+    }
+    const data = await response[type]();
+    signal?.throwIfAborted();
+    return data;
+  } catch (error) {
+    if (timeout.aborted && !signal?.aborted) throw new Error("请求超时（300 秒），请重试");
+    throw error;
+  }
+}
+const fetchJson = (url, signal) => fetchResource(url, "json", signal);
+async function fetchGroup(name, urls, signal, required = urls.length) {
+  const total = urls.filter(Boolean).length;
+  if (!total) { loadState(name, "无数据", signal); return null; }
+  let done = 0;
+  let failed = false;
+  loadState(name, `下载中 0/${total}`, signal);
+  try {
+    return await Promise.all(urls.map(async (url, i) => {
+      if (!url) return null;
+      const data = await fetchResource(url, "arrayBuffer", signal).catch(error => {
+        if (i < required || signal.aborted) throw error;
+        loadState(`${name}附加文件`, `失败：${error.message}（保留点云）`, signal);
+        return null;
+      });
+      done++;
+      if (!failed) loadState(name, `已下载 ${done}/${total}`, signal);
+      return data;
+    }));
+  } catch (error) {
+    failed = true;
+    loadState(name, `失败：${error.message}`, signal);
+    return null;
+  }
 }
 
 function quatToRotMat(q) {
@@ -426,28 +596,28 @@ function staticAggInVehicle(pose, xRange, yRange, zRange) {
   const T_v_map = invertRigid4(T_map_v);
   const xyz = transformPoints(staticAgg.xyz, T_v_map);
   const n = staticAgg.n;
-  const keep = [];
-  for (let i = 0; i < n; i++) {
-    const o = i * 3;
-    const x = xyz[o],
-      y = xyz[o + 1],
-      z = xyz[o + 2];
-    if (xRange && (x < xRange[0] || x > xRange[1])) continue;
-    if (yRange && (y < yRange[0] || y > yRange[1])) continue;
-    if (zRange && (z < zRange[0] || z > zRange[1])) continue;
-    keep.push(i);
-  }
-  const m = keep.length;
+  if (!xRange && !yRange && !zRange) return { xyz, labels: staticAgg.labels, lidar: staticAgg.lidar, n };
+  // Two passes over the flat buffer: no multi-million-element index array.
+  const labels = staticAgg.labels;
+  const lidar = staticAgg.lidar;
+  const inBox = (o) =>
+    !(xRange && (xyz[o] < xRange[0] || xyz[o] > xRange[1])) &&
+    !(yRange && (xyz[o + 1] < yRange[0] || xyz[o + 1] > yRange[1])) &&
+    !(zRange && (xyz[o + 2] < zRange[0] || xyz[o + 2] > zRange[1]));
+  let m = 0;
+  for (let i = 0; i < n; i++) if (inBox(i * 3)) m++;
   const outX = new Float32Array(m * 3);
   const outL = new Uint8Array(m);
   const outI = new Uint8Array(m);
-  for (let k = 0; k < m; k++) {
-    const i = keep[k];
-    outX[k * 3] = xyz[i * 3];
-    outX[k * 3 + 1] = xyz[i * 3 + 1];
-    outX[k * 3 + 2] = xyz[i * 3 + 2];
-    outL[k] = staticAgg.labels[i];
-    outI[k] = staticAgg.lidar ? staticAgg.lidar[i] : 0;
+  for (let i = 0, k = 0; i < n; i++) {
+    const o = i * 3;
+    if (!inBox(o)) continue;
+    outX[k * 3] = xyz[o];
+    outX[k * 3 + 1] = xyz[o + 1];
+    outX[k * 3 + 2] = xyz[o + 2];
+    outL[k] = labels[i];
+    outI[k] = lidar ? lidar[i] : 0;
+    k++;
   }
   return { xyz: outX, labels: outL, lidar: outI, n: m };
 }
@@ -476,28 +646,54 @@ function mergeStaticAndDynamicPoints(staticPart, dynXYZ, dynLab, dynLid) {
   return { xyz, labels: lab, lidar: lid };
 }
 
-async function loadStaticAggFromIndex() {
+let staticAggKey = "";
+async function loadStaticAggFromIndex(signal) {
+  const key = `${sceneRoot}:${currentOccVariant}`;
+  if (staticAgg && staticAggKey === key) {
+    loadState("聚合点云", `已缓存 ${staticAgg.n.toLocaleString()} 点`, signal);
+    return;
+  }
   staticAgg = null;
   const pointAgg = index && index.point_aggregate;
   const staticVariants = index && index.static_agg_variants;
   const sa = pointAgg || (staticVariants && staticVariants[currentOccVariant]) ||
     (index && index.static_agg);
-  if (!sa || !sa.xyz_map || !sa.labels) return;
-  const xyzBuf = await fetchBin(assetUrl(sa.xyz_map.uri));
-  const labBuf = await fetchBin(assetUrl(sa.labels.uri));
-  let lid = null;
-  if (sa.lidar_id && sa.lidar_id.uri) {
-    lid = new Uint8Array(await fetchBin(assetUrl(sa.lidar_id.uri)));
-  }
+  if (!sa || !sa.xyz_map || !sa.labels) { loadState("聚合点云", "无数据", signal); return; }
+  const previewName = (uri) => {
+    const i = String(uri).lastIndexOf("/") + 1;
+    return `${uri.slice(0, i)}preview_${uri.slice(i)}`;
+  };
+  const urls = [sa.xyz_map, sa.labels, sa.lidar_id].map(asset =>
+    asset?.uri ? assetUrl(externalSource ? asset.uri : previewName(asset.uri)) : null);
+  const buffers = await fetchGroup("聚合点云", urls, signal, 2);
+  if (!buffers || signal.aborted) return;
+  const [xyzBuf, labBuf, lidBuf] = buffers;
+  const lid = lidBuf ? new Uint8Array(lidBuf) : null;
+  const xyz = new Float32Array(xyzBuf);
+  const labels = new Uint8Array(labBuf);
+  const n = labels.length;
+  if (xyz.length !== n * 3) throw new Error("聚合点坐标与标签数量不匹配");
   staticAgg = {
-    xyz: new Float32Array(xyzBuf),
-    labels: new Uint8Array(labBuf),
+    xyz,
+    labels,
     lidar: lid,
-    n: sa.n || new Uint8Array(labBuf).length,
+    n,
     voxel: sa.voxel || 0.25,
     full: Boolean(pointAgg),
   };
-  setStatus(`${staticAgg.full ? "full point aggregate" : "static_agg"} loaded · n=${staticAgg.n.toLocaleString()}`);
+  staticAggKey = key;
+  loadState("聚合点云", `已加载 ${n.toLocaleString()} 点`, signal);
+}
+
+function inferLabelEncoding(labels) {
+  if (!labels || !labels.length) return labelEncoding;
+  let max = 0;
+  for (let i = 0; i < labels.length; i++) {
+    if (labels[i] > max) max = labels[i];
+    if (max > 4) break;
+  }
+  labelEncoding = max <= 4 ? "c5" : "fine22";
+  return labelEncoding;
 }
 
 function fineToCoarse(lab) {
@@ -506,6 +702,24 @@ function fineToCoarse(lab) {
   if (Cdyn.has(i)) return "dynamic";
   if (Cfree.has(i)) return "freespace";
   if (Csta.has(i)) return "static";
+  return "noise";
+}
+
+function labelToC5(lab) {
+  const i = lab | 0;
+  if (labelEncoding === "c5") {
+    if (i === 0) return "dynamic";
+    if (i === 1) return "static";
+    if (i === 2) return "noise";
+    if (i === 3) return "drivable";
+    if (i === 4) return "non_drivable";
+    return "noise";
+  }
+  if (i < 0 || i === 255 || (nFine && i >= nFine)) return "noise";
+  if (C5dyn && C5dyn.has(i)) return "dynamic";
+  if (C5sta && C5sta.has(i)) return "static";
+  if (C5drv && C5drv.has(i)) return "drivable";
+  if (C5ndrv && C5ndrv.has(i)) return "non_drivable";
   return "noise";
 }
 
@@ -531,16 +745,20 @@ function readRoiFromInputs() {
   return roi;
 }
 
-function inRoi(x, y, z) {
-  if (!el.togRoiClip || !el.togRoiClip.checked) return true;
-  return x >= roi.x0 && x <= roi.x1 && y >= roi.y0 && y <= roi.y1 && z >= roi.z0 && z <= roi.z1;
-}
-
 function coarseVisible(name) {
   if (name === "dynamic") return !el.togDyn || el.togDyn.checked;
   if (name === "static") return !el.togSta || el.togSta.checked;
   if (name === "freespace") return !el.togFree || el.togFree.checked;
   if (name === "noise") return !el.togNoise || el.togNoise.checked;
+  return true;
+}
+
+function coarse5Visible(name) {
+  if (name === "dynamic") return !el.togC5Dyn || el.togC5Dyn.checked;
+  if (name === "static") return !el.togC5Sta || el.togC5Sta.checked;
+  if (name === "noise") return !el.togC5Noise || el.togC5Noise.checked;
+  if (name === "drivable") return !el.togC5Drv || el.togC5Drv.checked;
+  if (name === "non_drivable") return !el.togC5Ndrv || el.togC5Ndrv.checked;
   return true;
 }
 
@@ -598,6 +816,10 @@ function resolveClassColors(meta) {
 
 function colorFromLabel(label) {
   const mode = colorModeValue();
+  if (mode === "coarse5") {
+    const c = (C5col && C5col[labelToC5(label)]) || C5_DEFAULT.colors_rgb.noise;
+    return new THREE.Color(c[0] / 255, c[1] / 255, c[2] / 255);
+  }
   if (mode === "coarse") {
     const c = Ccol[fineToCoarse(label)] || Ccol.noise;
     return new THREE.Color(c[0] / 255, c[1] / 255, c[2] / 255);
@@ -617,6 +839,10 @@ function colorFromLidar(lid) {
 
 function rgbCss(label) {
   const mode = colorModeValue();
+  if (mode === "coarse5") {
+    const c = (C5col && C5col[labelToC5(label)]) || C5_DEFAULT.colors_rgb.noise;
+    return `rgb(${c[0]},${c[1]},${c[2]})`;
+  }
   if (mode === "coarse") {
     const c = Ccol[fineToCoarse(label)] || Ccol.noise;
     return `rgb(${c[0]},${c[1]},${c[2]})`;
@@ -636,6 +862,7 @@ function rgbCssLidar(lid) {
 
 function syncColorModeUi() {
   const mode = colorModeValue();
+  if (el.coarse5Toggles) el.coarse5Toggles.style.display = mode === "coarse5" ? "block" : "none";
   if (el.coarseToggles) el.coarseToggles.style.display = mode === "coarse" ? "block" : "none";
   if (el.lidarToggles) el.lidarToggles.style.display = mode === "lidar" ? "block" : "none";
   renderClassLegend();
@@ -644,6 +871,17 @@ function syncColorModeUi() {
 function renderClassLegend() {
   if (!el.classLegend) return;
   const mode = colorModeValue();
+  if (mode === "coarse5") {
+    const names = C5ord || C5_DEFAULT.order;
+    el.classLegend.innerHTML = names.map((name) => {
+      const c = (C5col && C5col[name]) || C5_DEFAULT.colors_rgb[name] || [160, 160, 160];
+      return `<div class="legend-item" title="${name}">
+        <i class="legend-swatch" style="background:rgb(${c[0]},${c[1]},${c[2]})"></i>
+        <span>${name}</span>
+      </div>`;
+    }).join("");
+    return;
+  }
   if (mode === "coarse") {
     el.classLegend.innerHTML = Cord.map((name) => {
       const c = Ccol[name];
@@ -728,99 +966,88 @@ function clearPoints() {
  * not on raw point positions.
  */
 function buildOccMesh() {
+  renderPending = true;
   clearOcc();
   if (!occIjk || !occLabels || !currentMeta || !activeVoxel) return;
-  const nAll = occLabels.length;
   const v = activeVoxel;
-  const x0 = currentMeta.x_range[0];
-  const y0 = currentMeta.y_range[0];
-  const z0 = currentMeta.z_range[0];
-  const gap = Math.max(0, Number(el.occGap.value));
-  const grow = Number(el.occGrow.value);
-  const size = Math.max(1e-4, v * (1.0 - gap) * grow);
+  const origin = [currentMeta.x_range[0], currentMeta.y_range[0], currentMeta.z_range[0]];
+  const size = Math.max(1e-4, v * (1 - Number(el.occGap.value)) * Number(el.occGrow.value));
   const mode = colorModeValue();
-
-  const keepIdx = [];
-  const centersAll = new Float32Array(nAll * 3);
-  for (let i = 0; i < nAll; i++) {
-    const ix = occIjk[i * 3];
-    const iy = occIjk[i * 3 + 1];
-    const iz = occIjk[i * 3 + 2];
-    const vx = x0 + (ix + 0.5) * v;
-    const vy = y0 + (iy + 0.5) * v;
-    const vz = z0 + (iz + 0.5) * v;
-    centersAll[i * 3] = vx;
-    centersAll[i * 3 + 1] = vy;
-    centersAll[i * 3 + 2] = vz;
-    if (!inRoi(vx, vy, vz)) continue;
-    if (mode === "coarse" && !coarseVisible(fineToCoarse(occLabels[i]))) continue;
-    keepIdx.push(i);
-  }
-
-  const n = keepIdx.length;
-  if (n === 0) {
-    occCenters = new Float32Array(0);
-    occProjLabels = null;
-    occProjIjk = null;
-    return;
-  }
-
-  const geo = new THREE.BoxGeometry(size, size, size);
-  let op = Number(el.occOpacity.value);
-  if (pointsObj && el.togPts.checked && el.togOcc.checked) {
-    op = Math.min(op, 0.35);
-  }
-  const mat = new THREE.MeshLambertMaterial({
-    transparent: op < 0.999,
-    opacity: op,
-    depthWrite: true,
-  });
-  const mesh = new THREE.InstancedMesh(geo, mat, n);
-  const dummy = new THREE.Object3D();
-  const color = new THREE.Color();
-  const centers = new Float32Array(n * 3);
-  const labs = new Uint8Array(n);
-  const ijks = new Int32Array(n * 3);
-
-  for (let k = 0; k < n; k++) {
-    const i = keepIdx[k];
-    const vx = centersAll[i * 3];
-    const vy = centersAll[i * 3 + 1];
-    const vz = centersAll[i * 3 + 2];
-    centers[k * 3] = vx;
-    centers[k * 3 + 1] = vy;
-    centers[k * 3 + 2] = vz;
-    labs[k] = occLabels[i];
-    ijks[k * 3] = occIjk[i * 3];
-    ijks[k * 3 + 1] = occIjk[i * 3 + 1];
-    ijks[k * 3 + 2] = occIjk[i * 3 + 2];
-    vehToThree(vx, vy, vz, dummy.position);
-    dummy.updateMatrix();
-    mesh.setMatrixAt(k, dummy.matrix);
-    // lidar mode: occ still uses fine semantic (or coarse if switched)
-    if (mode === "lidar") {
-      // force fine coloring for occ under lidar mode
-      const iLab = occLabels[i] | 0;
-      if (classColors && iLab >= 0 && iLab < classColors.length && classColors[iLab]) {
-        const c = classColors[iLab];
-        color.setRGB(c[0] / 255, c[1] / 255, c[2] / 255);
-      } else {
-        color.setRGB(0.7, 0.7, 0.7);
-      }
-    } else {
-      color.copy(colorFromLabel(occLabels[i]));
+  inferLabelEncoding(occLabels);
+  // Hot loop over every voxel: hoist DOM state, precompute label visibility.
+  const roiOn = !useClipAggregate() && !!(el.togRoiClip && el.togRoiClip.checked);
+  const rx0 = roi.x0, rx1 = roi.x1, ry0 = roi.y0, ry1 = roi.y1, rz0 = roi.z0, rz1 = roi.z1;
+  const ox = origin[0], oy = origin[1], oz = origin[2];
+  const vis = new Uint8Array(256);
+  if (mode === "coarse" || mode === "coarse5") {
+    for (let lab = 0; lab < 256; lab++) {
+      vis[lab] = mode === "coarse" ? coarseVisible(fineToCoarse(lab)) : coarse5Visible(labelToC5(lab));
     }
-    mesh.setColorAt(k, color);
+  } else {
+    vis.fill(1);
   }
-  mesh.instanceMatrix.needsUpdate = true;
-  if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
-  mesh.frustumCulled = false;
-  occMesh = mesh;
+  const keep = [];
+  const ijk = occIjk, labs = occLabels;
+  for (let i = 0; i < labs.length; i++) {
+    const o = i * 3;
+    if (roiOn) {
+      const x = ox + (ijk[o] + 0.5) * v;
+      const y = oy + (ijk[o + 1] + 0.5) * v;
+      const z = oz + (ijk[o + 2] + 0.5) * v;
+      if (x < rx0 || x > rx1 || y < ry0 || y > ry1 || z < rz0 || z > rz1) continue;
+    }
+    if (!vis[labs[i]]) continue;
+    keep.push(i);
+  }
+  const n = keep.length;
+  occCenters = new Float32Array(n * 3);
+  occProjIjk = new Int32Array(n * 3);
+  occProjLabels = new Uint8Array(n);
+  if (!n) return;
+  const positions = new Float32Array(n * 3);
+  const colors = new Float32Array(n * 3);
+  const palette = Array.from({ length: 256 }, (_, label) => {
+    if (mode !== "lidar") return colorFromLabel(label);
+    const c = classColors?.[label] || [180, 180, 180];
+    return new THREE.Color(c[0] / 255, c[1] / 255, c[2] / 255);
+  });
+  for (let k = 0; k < n; k++) {
+    const i = keep[k], o = k * 3;
+    for (let axis = 0; axis < 3; axis++) {
+      occProjIjk[o + axis] = occIjk[i * 3 + axis];
+      occCenters[o + axis] = origin[axis] + (occIjk[i * 3 + axis] + 0.5) * v;
+    }
+    positions[o] = -occCenters[o];
+    positions[o + 1] = occCenters[o + 2];
+    positions[o + 2] = occCenters[o + 1];
+    occProjLabels[k] = occLabels[i];
+    palette[occLabels[i]].toArray(colors, o);
+  }
+  const opacity = pointsObj && el.togPts.checked ? Math.min(Number(el.occOpacity.value), 0.35) : Number(el.occOpacity.value);
+  if (el.occStyle.value === "cubes") {
+    occMesh = new THREE.InstancedMesh(new THREE.BoxGeometry(size, size, size),
+      new THREE.MeshBasicMaterial({ opacity, transparent: opacity < 1 }), n);
+    const matrices = occMesh.instanceMatrix.array;
+    for (let k = 0; k < n; k++) {
+      const m = k * 16, o = k * 3;
+      matrices[m] = matrices[m + 5] = matrices[m + 10] = matrices[m + 15] = 1;
+      matrices[m + 12] = positions[o];
+      matrices[m + 13] = positions[o + 1];
+      matrices[m + 14] = positions[o + 2];
+    }
+    occMesh.instanceMatrix.needsUpdate = true;
+    occMesh.instanceColor = new THREE.InstancedBufferAttribute(colors, 3);
+  } else {
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+    occMesh = new THREE.Points(geometry, new THREE.PointsMaterial({
+      size, sizeAttenuation: true, vertexColors: true, opacity, transparent: opacity < 1, depthWrite: false,
+    }));
+  }
+  occMesh.frustumCulled = false;
   occMesh.visible = el.togOcc.checked;
-  scene.add(mesh);
-  occCenters = centers;
-  occProjLabels = labs;
-  occProjIjk = ijks;
+  scene.add(occMesh);
 }
 
 function voxelizeFromPoints(voxel) {
@@ -902,22 +1129,39 @@ function applyOccupancy(ijk, labels, voxel, sourceNote) {
 }
 
 function buildPoints() {
+  renderPending = true;
   clearPoints();
   if (!ptXYZ || !ptLabels) return;
+  inferLabelEncoding(ptLabels);
   const nAll = ptLabels.length;
   const mode = colorModeValue();
+  const palette = Array.from({ length: 256 }, (_, label) => mode === "lidar" ? colorFromLidar(label) : colorFromLabel(label));
+  // Hot loop over every point: hoist DOM state, precompute visibility LUTs.
+  const roiOn = !useClipAggregate() && !!(el.togRoiClip && el.togRoiClip.checked);
+  const rx0 = roi.x0, rx1 = roi.x1, ry0 = roi.y0, ry1 = roi.y1, rz0 = roi.z0, rz1 = roi.z1;
+  const vis = new Uint8Array(256);
+  if (mode === "coarse" || mode === "coarse5") {
+    for (let lab = 0; lab < 256; lab++) {
+      vis[lab] = mode === "coarse" ? coarseVisible(fineToCoarse(lab)) : coarse5Visible(labelToC5(lab));
+    }
+  } else {
+    vis.fill(1);
+  }
+  const lidVis = new Uint8Array(256).fill(1);
+  if (mode === "lidar") {
+    for (let lid = 0; lid < 256; lid++) lidVis[lid] = lidarVisible(lid);
+  }
   const keepIdx = [];
   for (let i = 0; i < nAll; i++) {
-    const o = i * 3;
-    const x = ptXYZ[o];
-    const y = ptXYZ[o + 1];
-    const z = ptXYZ[o + 2];
-    if (!inRoi(x, y, z)) continue;
-    if (mode === "coarse" && !coarseVisible(fineToCoarse(ptLabels[i]))) continue;
-    if (mode === "lidar") {
-      const lid = ptLidar ? ptLidar[i] : 0;
-      if (!lidarVisible(lid)) continue;
+    if (roiOn) {
+      const o = i * 3;
+      const x = ptXYZ[o];
+      const y = ptXYZ[o + 1];
+      const z = ptXYZ[o + 2];
+      if (x < rx0 || x > rx1 || y < ry0 || y > ry1 || z < rz0 || z > rz1) continue;
     }
+    if (!vis[ptLabels[i]]) continue;
+    if (mode === "lidar" && !lidVis[ptLidar ? ptLidar[i] : 0]) continue;
     keepIdx.push(i);
   }
   const n = keepIdx.length;
@@ -941,9 +1185,7 @@ function buildPoints() {
     projXYZ[pk + 2] = ptXYZ[o + 2];
     projLab[k] = ptLabels[i];
     projLid[k] = ptLidar ? ptLidar[i] : 0;
-    let c;
-    if (mode === "lidar") c = colorFromLidar(projLid[k]);
-    else c = colorFromLabel(ptLabels[i]);
+    const c = palette[mode === "lidar" ? projLid[k] : ptLabels[i]];
     colors[pk] = c.r;
     colors[pk + 1] = c.g;
     colors[pk + 2] = c.b;
@@ -984,44 +1226,7 @@ function fitCamera(meta) {
   controls.update();
 }
 
-function projectOneVeh(x, y, z, cam, useDistortion = true) {
-  const K = cam.K;
-  const T = cam.T_c_v_lidar_ref || cam.T_c_v;
-  const fx = K[0],
-    fy = K[4],
-    cx = K[2],
-    cy = K[5];
-  const xc = T[0] * x + T[1] * y + T[2] * z + T[3];
-  const yc = T[4] * x + T[5] * y + T[6] * z + T[7];
-  const zc = T[8] * x + T[9] * y + T[10] * z + T[11];
-  if (zc <= 0.3) return null;
-  let xn = xc / zc;
-  let yn = yc / zc;
-  if (useDistortion) {
-    const dist = cam.dist5 || [0, 0, 0, 0, 0];
-    const k1 = dist[0] || 0,
-      k2 = dist[1] || 0,
-      p1 = dist[2] || 0,
-      p2 = dist[3] || 0,
-      k3 = dist[4] || 0;
-    const r2 = xn * xn + yn * yn;
-    // Guard extreme radtan (e.g. camera17 k3≈-3.8) outside reliable FOV.
-    if (r2 > 1.2) return null;
-    const r4 = r2 * r2;
-    const r6 = r4 * r2;
-    const radial = 1 + k1 * r2 + k2 * r4 + k3 * r6;
-    if (!Number.isFinite(radial) || Math.abs(radial) > 20) return null;
-    const xpp = xn * radial + 2 * p1 * xn * yn + p2 * (r2 + 2 * xn * xn);
-    const ypp = yn * radial + p1 * (r2 + 2 * yn * yn) + 2 * p2 * xn * yn;
-    if (!Number.isFinite(xpp) || !Number.isFinite(ypp)) return null;
-    xn = xpp;
-    yn = ypp;
-  }
-  const u = fx * xn + cx;
-  const v = fy * yn + cy;
-  if (!Number.isFinite(u) || !Number.isFinite(v)) return null;
-  return { u, v, z: zc };
-}
+const ZERO_DIST5 = [0, 0, 0, 0, 0];
 
 function projectionUsesDistortion() {
   return Boolean(el.projDistortion && el.projDistortion.checked);
@@ -1046,8 +1251,7 @@ function projectOccCubes(cam, maxCells = 60000) {
   const n = labs.length;
   let step = 1;
   if (n > maxCells) step = Math.ceil(n / maxCells);
-  const w = cam.width || 1920;
-  const h = cam.height || 1080;
+  const { w, h } = camSize(cam);
   // Rectangular image bounds only — do NOT gate on r² (that draws a circle
   // on wide pinhole cams and looks like a wrong fisheye model).
   const uLo = -0.02 * w;
@@ -1056,6 +1260,46 @@ function projectOccCubes(cam, maxCells = 60000) {
   const vHi = 1.02 * h;
   const nearZ = 1.0;
   const maxSpan = 0.12 * Math.max(w, h);
+
+  // Hoisted projection state; per-corner math writes into one scratch point
+  // instead of allocating a {u,v,z} object for each of the 8 corners.
+  const useDist = projectionUsesDistortion();
+  const T = cam.T_c_v_lidar_ref || cam.T_c_v;
+  const K = cam.K;
+  const fx = K[0], fy = K[4], cx = K[2], cy = K[5];
+  const dist = useDist ? (cam.dist5 || ZERO_DIST5) : ZERO_DIST5;
+  const k1 = dist[0] || 0, k2 = dist[1] || 0, p1 = dist[2] || 0, p2 = dist[3] || 0, k3 = dist[4] || 0;
+  const fxBound = K[0] || 1000;
+  const scratch = { u: 0, v: 0, z: 0 };
+  const projectTo = (x, y, z) => {
+    const xc = T[0] * x + T[1] * y + T[2] * z + T[3];
+    const yc = T[4] * x + T[5] * y + T[6] * z + T[7];
+    const zc = T[8] * x + T[9] * y + T[10] * z + T[11];
+    if (zc <= 0.3) return false;
+    let xn = xc / zc;
+    let yn = yc / zc;
+    if (useDist) {
+      const r2 = xn * xn + yn * yn;
+      // Guard extreme radtan (e.g. camera17 k3≈-3.8) outside reliable FOV.
+      if (r2 > 1.2) return false;
+      const r4 = r2 * r2;
+      const radial = 1 + k1 * r2 + k2 * r4 + k3 * (r4 * r2);
+      if (!Number.isFinite(radial) || Math.abs(radial) > 20) return false;
+      const xpp = xn * radial + 2 * p1 * xn * yn + p2 * (r2 + 2 * xn * xn);
+      const ypp = yn * radial + p1 * (r2 + 2 * yn * yn) + 2 * p2 * xn * yn;
+      if (!Number.isFinite(xpp) || !Number.isFinite(ypp)) return false;
+      xn = xpp;
+      yn = ypp;
+    }
+    const u = fx * xn + cx;
+    const vv = fy * yn + cy;
+    if (!Number.isFinite(u) || !Number.isFinite(vv)) return false;
+    scratch.u = u;
+    scratch.v = vv;
+    scratch.z = zc;
+    return true;
+  };
+  const cornerUV = new Float64Array(16);
 
   const quads = [];
   for (let i = 0; i < n; i += step) {
@@ -1068,71 +1312,44 @@ function projectOccCubes(cam, maxCells = 60000) {
     const yb = y0 + (iy + 1) * v;
     const za = z0 + iz * v;
     const zb = z0 + (iz + 1) * v;
-    const cx = 0.5 * (xa + xb);
-    const cy = 0.5 * (ya + yb);
-    const cz = 0.5 * (za + zb);
-    const cProj = projectOneVeh(cx, cy, cz, cam, projectionUsesDistortion());
-    if (!cProj || cProj.z < nearZ) continue;
+    if (!projectTo(0.5 * (xa + xb), 0.5 * (ya + yb), 0.5 * (za + zb))) continue;
+    if (scratch.z < nearZ) continue;
     // Center must land inside the image — otherwise corner hulls become
     // huge radial wings (esp. camera17 / strong radtan).
-    if (cProj.u < 0 || cProj.u >= w || cProj.v < 0 || cProj.v >= h) continue;
+    if (scratch.u < 0 || scratch.u >= w || scratch.v < 0 || scratch.v >= h) continue;
 
-    const corners3 = [
-      [xa, ya, za],
-      [xb, ya, za],
-      [xb, yb, za],
-      [xa, yb, za],
-      [xa, ya, zb],
-      [xb, ya, zb],
-      [xb, yb, zb],
-      [xa, yb, zb],
-    ];
-    const pts = [];
     let zSum = 0;
     let ok = true;
-    let uMin = Infinity,
-      uMax = -Infinity,
-      vMin = Infinity,
-      vMax = -Infinity;
+    let uMin = Infinity, uMax = -Infinity, vMin = Infinity, vMax = -Infinity;
     for (let c = 0; c < 8; c++) {
-      const p = projectOneVeh(
-        corners3[c][0],
-        corners3[c][1],
-        corners3[c][2],
-        cam,
-        projectionUsesDistortion()
-      );
       // All 8 corners must be valid — partial cubes → huge warped shards.
-      if (!p || p.z < nearZ) {
-        ok = false;
-        break;
-      }
-      if (p.u < uLo || p.u > uHi || p.v < vLo || p.v > vHi) {
-        ok = false;
-        break;
-      }
-      pts.push(p);
-      zSum += p.z;
-      if (p.u < uMin) uMin = p.u;
-      if (p.u > uMax) uMax = p.u;
-      if (p.v < vMin) vMin = p.v;
-      if (p.v > vMax) vMax = p.v;
+      if (!projectTo(c & 1 ? xb : xa, c & 2 ? yb : ya, c & 4 ? zb : za)) { ok = false; break; }
+      const u = scratch.u, vv = scratch.v;
+      if (scratch.z < nearZ || u < uLo || u > uHi || vv < vLo || vv > vHi) { ok = false; break; }
+      cornerUV[c * 2] = u;
+      cornerUV[c * 2 + 1] = vv;
+      zSum += scratch.z;
+      if (u < uMin) uMin = u;
+      if (u > uMax) uMax = u;
+      if (vv < vMin) vMin = vv;
+      if (vv > vMax) vMax = vv;
     }
-    if (!ok || pts.length !== 8) continue;
+    if (!ok) continue;
     if (uMax - uMin > maxSpan || vMax - vMin > maxSpan) continue;
     // Drop cubes whose silhouette is far larger than a voxel at that depth
     // (camera17 / strong radtan otherwise paints huge wing shards).
     const zMean = zSum / 8;
-    const fx = cam.K[0] || 1000;
-    const expect = (2.5 * v * fx) / Math.max(zMean, nearZ);
+    const expect = (2.5 * v * fxBound) / Math.max(zMean, nearZ);
     if (uMax - uMin > Math.max(24, 3 * expect) || vMax - vMin > Math.max(24, 3 * expect)) {
       continue;
     }
+    const pts = [];
+    for (let c = 0; c < 8; c++) pts.push({ u: cornerUV[c * 2], v: cornerUV[c * 2 + 1] });
     const hull = convexHull2D(pts);
     if (hull.length < 3) continue;
     quads.push({
       pts: hull,
-      z: zSum / 8,
+      z: zMean,
       lab: labs[i],
     });
   }
@@ -1140,7 +1357,7 @@ function projectOccCubes(cam, maxCells = 60000) {
   return quads;
 }
 
-/** Monotone chain convex hull on {u,v} points (returns CCW). */
+/** Monotone chain convex hull/** Monotone chain convex hull on {u,v} points (returns CCW). */
 function convexHull2D(points) {
   const pts = points.slice().sort((a, b) => (a.u === b.u ? a.v - b.v : a.u - b.u));
   if (pts.length <= 2) return pts;
@@ -1184,17 +1401,21 @@ function projectVehToImage(xyz, labels, cam, maxN = 120000, lidarIds = null) {
   const dist = projectionUsesDistortion()
     ? (cam.dist5 || [0, 0, 0, 0, 0])
     : [0, 0, 0, 0, 0];
-  const w = cam.width;
-  const h = cam.height;
+  const { w, h } = camSize(cam);
   const fx = K[0], fy = K[4], cx = K[2], cy = K[5];
   const k1 = dist[0] || 0, k2 = dist[1] || 0, p1 = dist[2] || 0, p2 = dist[3] || 0, k3 = dist[4] || 0;
   const nAll = labels.length;
   const step = nAll > maxN ? Math.ceil(nAll / maxN) : 1;
+  const classFilter = el.projClassFilter ? el.projClassFilter.value : "all";
+  const classFilterN = classFilter !== "all" ? Number(classFilter) : null;
+  const lidVis = new Uint8Array(256).fill(1);
+  if (lidarIds) {
+    for (let lid = 0; lid < 256; lid++) lidVis[lid] = lidarVisible(lid);
+  }
   const out = [];
   for (let i = 0; i < nAll; i += step) {
-    if (lidarIds && !lidarVisible(lidarIds[i])) continue;
-    const classFilter = el.projClassFilter ? el.projClassFilter.value : "all";
-    if (classFilter !== "all" && labels[i] !== Number(classFilter)) continue;
+    if (lidarIds && !lidVis[lidarIds[i]]) continue;
+    if (classFilterN !== null && labels[i] !== classFilterN) continue;
     const o = i * 3;
     const x = xyz[o], y = xyz[o + 1], z = xyz[o + 2];
     const xc = T[0] * x + T[1] * y + T[2] * z + T[3];
@@ -1227,23 +1448,22 @@ function projectVehToImage(xyz, labels, cam, maxN = 120000, lidarIds = null) {
   return out;
 }
 
+// Deliberately discrete and non-adjacent in RGB space. Smooth ramps hide
+// sub-metre objects; these bands make a cone cross several obvious colors.
+const HEIGHT_BAND_CSS = [
+  "rgb(25,25,210)",
+  "rgb(0,120,255)",
+  "rgb(0,235,255)",
+  "rgb(0,220,80)",
+  "rgb(245,245,0)",
+  "rgb(255,145,0)",
+  "rgb(255,35,20)",
+  "rgb(255,0,190)",
+];
 function heightRgbCss(z, zMin, zMax) {
   const span = Math.max(1e-6, zMax - zMin);
   const t = Math.max(0, Math.min(1, (z - zMin) / span));
-  // Deliberately discrete and non-adjacent in RGB space. Smooth ramps hide
-  // sub-metre objects; these bands make a cone cross several obvious colors.
-  const bands = [
-    [25, 25, 210],
-    [0, 120, 255],
-    [0, 235, 255],
-    [0, 220, 80],
-    [245, 245, 0],
-    [255, 145, 0],
-    [255, 35, 20],
-    [255, 0, 190],
-  ];
-  const rgb = bands[Math.min(bands.length - 1, Math.floor(t * bands.length))];
-  return `rgb(${rgb[0]},${rgb[1]},${rgb[2]})`;
+  return HEIGHT_BAND_CSS[Math.min(HEIGHT_BAND_CSS.length - 1, Math.floor(t * HEIGHT_BAND_CSS.length))];
 }
 
 /**
@@ -1252,15 +1472,23 @@ function heightRgbCss(z, zMin, zMax) {
  * RGB photo is always drawn first; overlays stay semi-transparent.
  */
 function drawProjectionOnCanvas(canvas, img, cam, mode, ptMinPx = 1) {
+  // RGB thumbnails use the decoded image directly; canvas work is only for overlays.
+  if (canvas.classList.contains("thumb")) {
+    const rgb = mode === "none" && img?.naturalWidth > 0;
+    img.style.display = rgb ? "block" : "none";
+    canvas.hidden = rgb;
+    if (rgb) return 0;
+  }
   const ctx = canvas.getContext("2d");
   const cw = canvas.width;
   const ch = canvas.height;
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.fillStyle = "#000";
   ctx.fillRect(0, 0, cw, ch);
-  const scale = Math.min(cw / cam.width, ch / cam.height);
-  const dw = cam.width * scale;
-  const dh = cam.height * scale;
+  const { w: camW, h: camH } = camSize(cam, img);
+  const scale = Math.min(cw / camW, ch / camH);
+  const dw = camW * scale;
+  const dh = camH * scale;
   const ox = (cw - dw) / 2;
   const oy = (ch - dh) / 2;
   const hasImg = img && img.complete && img.naturalWidth > 0;
@@ -1271,21 +1499,31 @@ function drawProjectionOnCanvas(canvas, img, cam, mode, ptMinPx = 1) {
     ctx.fillRect(ox, oy, dw, dh);
     ctx.fillStyle = "#888";
     ctx.font = "14px sans-serif";
-    ctx.fillText("loading image…", ox + 12, oy + 28);
+    ctx.fillText(img?.dataset.error || "图片加载中…", ox + 12, oy + 28);
   }
 
   if (mode === "none") return 0;
+  if (!cam.K || !(cam.T_c_v_lidar_ref || cam.T_c_v)) {
+    ctx.fillStyle = "rgba(0,0,0,0.7)";
+    ctx.fillRect(ox, oy, Math.min(dw, 360), 30);
+    ctx.fillStyle = "#fff";
+    ctx.font = "14px sans-serif";
+    ctx.fillText("RGB only: projection calibration unavailable", ox + 8, oy + 20);
+    return 0;
+  }
 
   const alpha = el.projAlpha ? Number(el.projAlpha.value) : 0.4;
-  const maxN = canvas.width >= cam.width * 0.8 ? 160000 : 70000;
+  const maxN = canvas.width >= camW * 0.8 ? 160000 : 70000;
 
   let n = 0;
   if (mode === "occ" || mode === "both") {
     if (occProjIjk && occProjLabels && occProjLabels.length && activeVoxel) {
       const faces = projectOccCubes(cam, maxN);
+      const occStyles = new Array(256);
+      for (let lab = 0; lab < 256; lab++) occStyles[lab] = fillStyleForOccLab(lab);
       ctx.globalAlpha = alpha;
       for (const q of faces) {
-        ctx.fillStyle = fillStyleForOccLab(q.lab);
+        ctx.fillStyle = occStyles[q.lab];
         ctx.beginPath();
         ctx.moveTo(ox + q.pts[0].u * scale, oy + q.pts[0].v * scale);
         for (let k = 1; k < q.pts.length; k++) {
@@ -1318,15 +1556,26 @@ function drawProjectionOnCanvas(canvas, img, cam, mode, ptMinPx = 1) {
       if (!Number.isFinite(zMin)) zMin = -2.2;
       if (!Number.isFinite(zMax)) zMax = 0.5;
       if (zMax <= zMin) zMax = zMin + 0.1;
+      // Per-label fill styles are constant for the whole batch — build once
+      // instead of re-reading the DOM and formatting strings per point.
+      let labStyles = null;
+      let lidStyles = null;
+      if (cmode === "lidar") {
+        lidStyles = new Array(256);
+        for (let lid = 0; lid < 256; lid++) lidStyles[lid] = rgbCssLidar(lid);
+      } else {
+        labStyles = new Array(256);
+        for (let lab = 0; lab < 256; lab++) labStyles[lab] = rgbCss(lab);
+      }
+      ctx.globalAlpha = alpha;
       for (const p of pts) {
         // Do not add hidden opacity: dense full-frame deskew points otherwise
         // cover the RGB image and make a successfully loaded frame look blank.
-        ctx.globalAlpha = alpha;
         ctx.fillStyle = coneOnly
           ? "rgb(255,80,0)"
           : heightMode
           ? heightRgbCss(p.zVeh, zMin, zMax)
-          : (cmode === "lidar" ? rgbCssLidar(p.lid || 0) : rgbCss(p.lab));
+          : (cmode === "lidar" ? lidStyles[p.lid || 0] : labStyles[p.lab]);
         ctx.fillRect(
           ox + p.u * scale - px * 0.5,
           oy + p.v * scale - px * 0.5,
@@ -1370,13 +1619,14 @@ function openLightbox(cam, img) {
   el.lbTitle.textContent = cam.name;
   const c = el.lbCanvas;
   // Native-ish resolution so zoom stays sharp
-  c.width = cam.width;
-  c.height = cam.height;
+  const { w: lbW, h: lbH } = camSize(cam, img);
+  c.width = lbW;
+  c.height = lbH;
   drawProjectionOnCanvas(c, img, cam, el.projMode.value, Number(el.projRadius.value));
   // Fit into stage on open (then Zoom+/wheel to enlarge)
   const sw = Math.max(320, el.lbStage.clientWidth - 40);
   const sh = Math.max(240, el.lbStage.clientHeight - 40);
-  lb.scale = Math.min(1, sw / cam.width, sh / cam.height);
+  lb.scale = Math.min(1, sw / lbW, sh / lbH);
   applyLbTransform();
   el.lightbox.classList.add("open");
 }
@@ -1400,7 +1650,8 @@ el.lbReset.addEventListener("click", () => {
   if (lb.cam) {
     const sw = Math.max(320, el.lbStage.clientWidth - 40);
     const sh = Math.max(240, el.lbStage.clientHeight - 40);
-    lb.scale = Math.min(1, sw / lb.cam.width, sh / lb.cam.height);
+    const sz = camSize(lb.cam);
+    lb.scale = Math.min(1, sw / sz.w, sh / sz.h);
   } else {
     lb.scale = 1;
   }
@@ -1439,31 +1690,37 @@ window.addEventListener("keydown", (e) => {
   if (e.key === "Escape") closeLightbox();
 });
 
-function renderCams(meta) {
+async function renderCams(meta, signal) {
   el.cams.innerHTML = "";
-  for (const cam of meta.cameras || []) {
+  const cameras = meta.assets?.cameras || meta.cameras || [];
+  let done = 0, failed = 0;
+  const report = () => loadState("相机图片", cameras.length
+    ? `成功 ${done}/${cameras.length}${failed ? ` · 失败 ${failed}` : ""}` : "无数据", signal);
+  report();
+  await Promise.all(cameras.map(async cam => {
     const card = document.createElement("div");
     card.className = "cam-card";
     card._cam = cam;
     const name = document.createElement("div");
     name.className = "name";
-    name.innerHTML = `<span>${cam.name}</span><span>${cam.width}×${cam.height} · click to zoom</span>`;
+    const sz = camSize(cam);
+    const cameraName = document.createElement("span");
+    cameraName.textContent = cam.name;
+    const cameraSize = document.createElement("span");
+    cameraSize.textContent = "加载中…";
+    name.append(cameraName, cameraSize);
     const stage = document.createElement("div");
     stage.className = "stage";
     const img = document.createElement("img");
     img.className = "base";
     img.crossOrigin = "anonymous";
     img.style.display = "none";
-    img.src = camImageUrl(cam);
     const canvas = document.createElement("canvas");
     canvas.className = "thumb";
     canvas.width = 1280;
     canvas.height = 720;
     stage.appendChild(img);
     stage.appendChild(canvas);
-    img.onload = () => {
-      drawProjectionOnCanvas(canvas, img, cam, el.projMode.value, Number(el.projRadius.value));
-    };
     stage.addEventListener("click", () => openLightbox(cam, img));
     card.appendChild(name);
     card.appendChild(stage);
@@ -1473,18 +1730,39 @@ function renderCams(meta) {
       card.classList.add("active");
     });
     el.cams.appendChild(card);
-  }
+    drawProjectionOnCanvas(canvas, img, cam, "none");
+    let objectUrl;
+    try {
+      const blob = await fetchResource(camImageUrl(cam), "blob", signal);
+      objectUrl = URL.createObjectURL(blob);
+      img.src = objectUrl;
+      await img.decode();
+      signal.throwIfAborted();
+      cameraSize.textContent = `${sz.w}×${sz.h} · click to zoom`;
+      done++;
+    } catch (error) {
+      if (signal.aborted) return;
+      failed++;
+      img.dataset.error = `图片失败：${error.message}`;
+      cameraSize.textContent = img.dataset.error;
+    } finally {
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    }
+    drawProjectionOnCanvas(canvas, img, cam, el.projMode.value, Number(el.projRadius.value));
+    report();
+  }));
 }
 
-async function loadFrame(frameEntry) {
-  setStatus("Loading frame…");
+async function loadFrame(frameEntry, signal) {
+  loadState("帧信息", "读取中…", signal);
   frameDir =
     frameEntry.dir ||
     (frameEntry.meta_uri ? frameEntry.meta_uri.replace(/\/meta\.json$/, "") : null);
   const metaUrl = frameEntry.meta_uri
     ? assetUrl(frameEntry.meta_uri)
     : `${sceneRoot}/${frameDir}/meta.json`;
-  const meta = await fetchJson(metaUrl);
+  const meta = await fetchJson(metaUrl, signal);
+  loadState("帧信息", "已加载", signal);
   currentMeta = meta;
   classColors = resolveClassColors(meta);
   classNames =
@@ -1506,58 +1784,58 @@ async function loadFrame(frameEntry) {
     meta.n_occ = (meta.stats && meta.stats.n_occ) || meta.n_occ;
   }
 
-  const ijkUrl = occAsset(meta, "ijk");
-  const labUrl = occAsset(meta, "labels");
-  const ijkBuf = await fetchBin(ijkUrl);
-  const labBuf = await fetchBin(labUrl);
-  const ijkArr = new Int32Array(ijkBuf);
-  const labArr = new Uint8Array(labBuf);
-  exportedOcc = {
-    voxel: meta.voxel,
-    ijk: ijkArr,
-    labels: labArr,
-  };
-
-  clearPoints();
-  ptXYZ = null;
-  ptLabels = null;
-  ptLidar = null;
-  framePtXYZ = null;
-  framePtLabels = null;
-  framePtLidar = null;
+  activeVoxel = meta.voxel;
+  fitCamera(meta);
+  const camerasReady = renderCams(meta, signal)
+    .catch(error => loadState("相机图片", `失败：${error.message}`, signal));
+  const aggregateReady = useClipAggregate()
+    ? loadStaticAggFromIndex(signal).catch(error => loadState("聚合点云", `失败：${error.message}`, signal))
+    : Promise.resolve(loadState("聚合点云", "按需加载：选择 Clip aggregate", signal));
+  const pointsReady = fetchGroup("帧点云bin", ["xyz", "labels", "lidar_id"].map(key => pointsAsset(meta, key)), signal, 2);
+  const sensorReady = fetchGroup("传感器点云", ["xyz", "labels", "lidar_id"].map(key => frameSensorPointsAsset(meta, key)), signal, 2);
+  const occupancyReady = (async () => {
+    const buffers = await fetchGroup("OCC", [occAsset(meta, "ijk"), occAsset(meta, "labels")], signal);
+    if (!buffers || signal.aborted) return;
+    try {
+      const ijk = new Int32Array(buffers[0]);
+      const labels = new Uint8Array(buffers[1]);
+      if (ijk.length !== labels.length * 3) throw new Error("体素坐标与标签数量不匹配");
+      exportedOcc = { voxel: meta.voxel, ijk, labels };
+      applyOccupancy(ijk, labels, meta.voxel, "exported grid");
+      loadState("OCC", `已加载 ${labels.length.toLocaleString()} 体素`, signal);
+      refreshCamProjections();
+    } catch (error) { loadState("OCC", `失败：${error.message}`, signal); }
+  })();
   let ptsNote = "not exported";
   let frameDynXYZ = null;
   let frameDynLab = null;
   let frameDynLid = null;
 
-  if (meta.points || (meta.assets && meta.assets.points)) {
+  const buffers = await pointsReady;
+  signal.throwIfAborted();
+  if (buffers) {
     try {
-      const xyzUrl = pointsAsset(meta, "xyz");
-      const labUrlP = pointsAsset(meta, "labels");
-      const lidUrl = pointsAsset(meta, "lidar_id");
-      const xyzBuf = await fetchBin(xyzUrl);
-      const plabBuf = await fetchBin(labUrlP);
-      const rawXYZ = new Float32Array(xyzBuf);
-      const rawLab = new Uint8Array(plabBuf);
-      let rawLid = null;
-      if (lidUrl) {
-        rawLid = new Uint8Array(await fetchBin(lidUrl));
-      }
-      // Keep frame dynamic only — static comes from clip static_agg + ego_pose.
-      const dynIdx = [];
-      for (let i = 0; i < rawLab.length; i++) {
-        if (Cdyn.has(rawLab[i] | 0)) dynIdx.push(i);
-      }
-      frameDynXYZ = new Float32Array(dynIdx.length * 3);
-      frameDynLab = new Uint8Array(dynIdx.length);
-      frameDynLid = new Uint8Array(dynIdx.length);
-      for (let k = 0; k < dynIdx.length; k++) {
-        const i = dynIdx[k];
-        frameDynXYZ[k * 3] = rawXYZ[i * 3];
-        frameDynXYZ[k * 3 + 1] = rawXYZ[i * 3 + 1];
-        frameDynXYZ[k * 3 + 2] = rawXYZ[i * 3 + 2];
-        frameDynLab[k] = rawLab[i];
-        frameDynLid[k] = rawLid ? rawLid[i] : 0;
+      const rawXYZ = new Float32Array(buffers[0]);
+      const rawLab = new Uint8Array(buffers[1]);
+      const rawLid = buffers[2] ? new Uint8Array(buffers[2]) : null;
+      if (rawXYZ.length !== rawLab.length * 3) throw new Error("点坐标与标签数量不匹配");
+      if (useClipAggregate()) {
+        // Keep frame dynamic only — static comes from clip static_agg + ego_pose.
+        const dynIdx = [];
+        for (let i = 0; i < rawLab.length; i++) {
+          if (Cdyn.has(rawLab[i] | 0)) dynIdx.push(i);
+        }
+        frameDynXYZ = new Float32Array(dynIdx.length * 3);
+        frameDynLab = new Uint8Array(dynIdx.length);
+        frameDynLid = new Uint8Array(dynIdx.length);
+        for (let k = 0; k < dynIdx.length; k++) {
+          const i = dynIdx[k];
+          frameDynXYZ[k * 3] = rawXYZ[i * 3];
+          frameDynXYZ[k * 3 + 1] = rawXYZ[i * 3 + 1];
+          frameDynXYZ[k * 3 + 2] = rawXYZ[i * 3 + 2];
+          frameDynLab[k] = rawLab[i];
+          frameDynLid[k] = rawLid ? rawLid[i] : 0;
+        }
       }
       ptXYZ = rawXYZ;
       ptLabels = rawLab;
@@ -1567,29 +1845,74 @@ async function loadFrame(frameEntry) {
       framePtLidar = rawLid;
       ptsNote = rawLab.length.toLocaleString();
     } catch (e) {
-      ptsNote = `export broken: ${e}`;
+      ptsNote = "加载失败";
+      loadState("帧点云bin", `失败：${e.message}`, signal);
     }
   }
 
-  const frameSensorXyzUrl = frameSensorPointsAsset(meta, "xyz");
-  const frameSensorLabelsUrl = frameSensorPointsAsset(meta, "labels");
-  const frameSensorLidarUrl = frameSensorPointsAsset(meta, "lidar_id");
-  if (frameSensorXyzUrl && frameSensorLabelsUrl) {
-    framePtXYZ = new Float32Array(await fetchBin(frameSensorXyzUrl));
-    framePtLabels = new Uint8Array(await fetchBin(frameSensorLabelsUrl));
-    framePtLidar = frameSensorLidarUrl
-      ? new Uint8Array(await fetchBin(frameSensorLidarUrl))
-      : null;
+  function displayPoints() {
+    if (ptXYZ && ptLabels) {
+      inferLabelEncoding(ptLabels);
+      try {
+        buildPoints();
+        loadState("点云显示", `已显示 ${ptLabels.length.toLocaleString()} 点`, signal);
+        let xmin = Infinity,
+          xmax = -Infinity,
+          ymin = Infinity,
+          ymax = -Infinity,
+          zmin = Infinity,
+          zmax = -Infinity;
+        for (let i = 0; i < ptXYZ.length; i += 3) {
+          xmin = Math.min(xmin, ptXYZ[i]);
+          xmax = Math.max(xmax, ptXYZ[i]);
+          ymin = Math.min(ymin, ptXYZ[i + 1]);
+          ymax = Math.max(ymax, ptXYZ[i + 1]);
+          zmin = Math.min(zmin, ptXYZ[i + 2]);
+          zmax = Math.max(zmax, ptXYZ[i + 2]);
+        }
+        document.getElementById("axisHelp").innerHTML = `
+          Arrows follow stored numeric signs.<br/>
+          <span style="color:var(--x)">+X</span> x∈[${xmin.toFixed(1)}, ${xmax.toFixed(1)}]<br/>
+          <span style="color:var(--y)">+Y</span> y∈[${ymin.toFixed(1)}, ${ymax.toFixed(1)}]<br/>
+          <span style="color:var(--z)">+Z</span> z∈[${zmin.toFixed(1)}, ${zmax.toFixed(1)}]<br/>
+          Three map: (x,z,y) so XY ground stays horizontal.
+        `;
+      } catch (e) {
+        ptsNote = "构建失败";
+        loadState("点云显示", `失败：${e.message}`, signal);
+      }
+    }
+    if (pointsObj && el.togPts.checked && occMesh && el.togOcc.checked) {
+      occMesh.material.transparent = true;
+      occMesh.material.opacity = Math.min(Number(el.occOpacity.value), 0.35);
+      occMesh.material.needsUpdate = true;
+    }
+    syncColorModeUi();
+    updateRoiHelper();
+    refreshCamProjections();
   }
 
-  // Prefer clip static_agg (map→vehicle) + frame dynamic. Same static points
-  // every frame; only ego_pose changes coordinates.
-  if (staticAgg && meta.ego_pose) {
+  // Show the current frame before waiting for any clip-wide or auxiliary data.
+  displayPoints();
+  if (pointsObj) {
+    el.sceneInfo.textContent = `当前帧点云：${ptsNote} 点。`;
+    setStatus("当前帧点云可查看；其他资产仍在加载…");
+  }
+  const sensorBuffers = await sensorReady;
+  await aggregateReady;
+  signal.throwIfAborted();
+  if (sensorBuffers) {
+    framePtXYZ = new Float32Array(sensorBuffers[0]);
+    framePtLabels = new Uint8Array(sensorBuffers[1]);
+    framePtLidar = sensorBuffers[2] ? new Uint8Array(sensorBuffers[2]) : null;
+  }
+
+  if (useClipAggregate() && staticAgg && egoPoseRecord(meta.ego_pose)) {
     const xr = meta.x_range;
     const yr = meta.y_range;
     const zr = meta.z_range;
     const st = staticAggInVehicle(
-      meta.ego_pose,
+      egoPoseRecord(meta.ego_pose),
       staticAgg.full ? null : [xr[0] * 1.5, xr[1] * 1.5],
       staticAgg.full ? null : yr,
       staticAgg.full ? null : [zr[0] - 2, zr[1] + 5]
@@ -1597,55 +1920,28 @@ async function loadFrame(frameEntry) {
     const merged = staticAgg.full
       ? st
       : mergeStaticAndDynamicPoints(st, frameDynXYZ, frameDynLab, frameDynLid);
-    ptXYZ = merged.xyz;
-    ptLabels = merged.labels;
-    ptLidar = merged.lidar;
-    ptsNote = staticAgg.full
-      ? `${merged.labels.length.toLocaleString()} (all deskew frames, pose-only)`
-      : `${merged.labels.length.toLocaleString()} (static_agg⊕dyn)`;
-    // Occupancy bins were already built from the same aggregate at export;
-    // keep them (fast). Points now match: same static set, pose-only change.
-    applyOccupancy(ijkArr, labArr, meta.voxel, "exported grid (static_agg⊕dyn)");
-  } else {
-    applyOccupancy(ijkArr, labArr, meta.voxel, "exported grid");
-  }
-
-  if (ptXYZ && ptLabels) {
-    try {
-      buildPoints();
-      let xmin = Infinity,
-        xmax = -Infinity,
-        ymin = Infinity,
-        ymax = -Infinity,
-        zmin = Infinity,
-        zmax = -Infinity;
-      for (let i = 0; i < ptXYZ.length; i += 3) {
-        xmin = Math.min(xmin, ptXYZ[i]);
-        xmax = Math.max(xmax, ptXYZ[i]);
-        ymin = Math.min(ymin, ptXYZ[i + 1]);
-        ymax = Math.max(ymax, ptXYZ[i + 1]);
-        zmin = Math.min(zmin, ptXYZ[i + 2]);
-        zmax = Math.max(zmax, ptXYZ[i + 2]);
-      }
-      document.getElementById("axisHelp").innerHTML = `
-        Arrows follow stored numeric signs.<br/>
-        <span style="color:var(--x)">+X</span> x∈[${xmin.toFixed(1)}, ${xmax.toFixed(1)}]<br/>
-        <span style="color:var(--y)">+Y</span> y∈[${ymin.toFixed(1)}, ${ymax.toFixed(1)}]<br/>
-        <span style="color:var(--z)">+Z</span> z∈[${zmin.toFixed(1)}, ${zmax.toFixed(1)}]<br/>
-        Three map: (x,z,y) so XY ground stays horizontal.
-      `;
-    } catch (e) {
-      ptsNote = `build points: ${e}`;
+    if (merged && merged.xyz) {
+      ptXYZ = merged.xyz;
+      ptLabels = merged.labels;
+      ptLidar = merged.lidar;
+    }
+    if (merged && merged.labels) {
+      framePtXYZ = merged.xyz;
+      framePtLabels = merged.labels;
+      framePtLidar = merged.lidar;
+      ptsNote = useClipAggregate()
+        ? `${merged.labels.length.toLocaleString()} (clip aggregate → current vehicle)`
+        : `${merged.labels.length.toLocaleString()} (vehicle ROI)`;
+      displayPoints();
     }
   }
-  syncColorModeUi();
-  updateRoiHelper();
-  // re-apply color/ROI filters now that points+occ are both loaded
-  rebuildColoredViews();
+
+  await Promise.all([occupancyReady, camerasReady]);
+  signal.throwIfAborted();
   const odBoxCount = buildOdBoxes(meta);
 
   el.sceneInfo.innerHTML = `
-    <div>occ voxels: <b>${occLabels ? occLabels.length.toLocaleString() : meta.n_occ.toLocaleString()}</b></div>
+    <div>occ voxels: <b>${occLabels ? occLabels.length.toLocaleString() : "未加载"}</b></div>
     <div>active voxel: <b>${activeVoxel}m</b> (exported ${meta.voxel}m)</div>
     <div>grid snap: floor((p-origin)/v)</div>
     <div>x: [${meta.x_range.join(", ")}]</div>
@@ -1655,14 +1951,12 @@ async function loadFrame(frameEntry) {
     <div>OD boxes: <b>${odBoxCount}</b> (yellow=oracle ID matched, red=unmatched)</div>
   `;
 
-  renderCams(meta);
-  fitCamera(meta);
-  if (pointsObj && el.togPts.checked && occMesh && el.togOcc.checked) {
-    occMesh.material.transparent = true;
-    occMesh.material.opacity = Math.min(Number(el.occOpacity.value), 0.35);
-    occMesh.material.needsUpdate = true;
-  }
-  setStatus(`ready · occ=${occLabels.length} · voxel=${activeVoxel}m · points=${ptsNote}`);
+
+  if (loadStarted) loadElapsedMs = performance.now() - loadStarted;
+  loadFinished = true;
+  showLoadProgress();
+  const failed = [...loadStates.values()].some(state => state.includes("失败"));
+  setStatus(`${failed ? "部分加载失败，详见左侧，可重试" : "ready"} · occ=${occLabels?.length || 0} · voxel=${activeVoxel}m · points=${ptsNote}`);
 }
 
 function updateFramePos() {
@@ -1681,6 +1975,7 @@ async function loadFrameByIndex(i) {
   if (!index || !index.frames || !index.frames.length) return;
   const n = index.frames.length;
   frameIndex = ((i % n) + n) % n;
+  const signal = beginLoad("正在加载当前帧…");
   const fr = index.frames[frameIndex];
   if (fr.meta_uri && !fr.dir) {
     fr.dir = fr.meta_uri.replace(/\/meta\.json$/, "");
@@ -1689,56 +1984,88 @@ async function loadFrameByIndex(i) {
     el.frameSelect.value = String(fr.timestamp || fr.frame_id);
   }
   updateFramePos();
-  await loadFrame(fr);
+  try {
+    await loadFrame(fr, signal);
+  } catch (error) {
+    loadFailure(error, signal);
+  }
 }
 
-async function loadClip(clipId) {
+async function loadClip(clipId, root) {
   const entry = clipsCatalog.find((c) => c.id === clipId || c.clip_id === clipId);
-  sceneRoot = (entry && entry.url ? entry.url : `/scenes/${clipId}`).replace(/\/$/, "");
+  sceneRoot = occUrl((root || entry?.url || `/scenes/${clipId}`).replace(/\/$/, ""));
   // keep URL shareable
   const u = new URL(location.href);
   u.searchParams.set("scene", sceneRoot);
   history.replaceState(null, "", u);
-  setStatus(`Loading clip ${clipId}…`);
-  index = await fetchJson(`${sceneRoot}/index.json`);
-  if (!index.clip && index.clip_id) index.clip = index.clip_id;
-  await loadStaticAggFromIndex();
-  if (el.occVariant) {
-    const config = index.occupancy_variants;
-    el.occVariant.innerHTML = "";
-    const variants = (config && config.variants) || [{ id: "litept", name: "LitePT dynamic" }];
-    for (const variant of variants) {
-      const opt = document.createElement("option");
-      opt.value = variant.id;
-      opt.textContent = variant.name || variant.id;
-      el.occVariant.appendChild(opt);
+  const signal = beginLoad("正在读取场景…");
+  loadState("场景目录", "读取中…", signal);
+  clipAggFitted = false;
+  index = null;
+  try {
+    index = await fetchJson(`${sceneRoot}/index.json`, signal);
+    if (externalSource) applyProfile(index);
+    if (!index.clip && index.clip_id) index.clip = index.clip_id;
+    if (el.occVariant) {
+      const config = index.occupancy_variants;
+      el.occVariant.innerHTML = "";
+      const variants = (config && config.variants) || [{ id: "litept", name: "LitePT dynamic" }];
+      for (const variant of variants) {
+        const opt = document.createElement("option");
+        opt.value = variant.id;
+        opt.textContent = variant.name || variant.id;
+        el.occVariant.appendChild(opt);
+      }
+      currentOccVariant = (config && config.default) || variants[0].id;
+      el.occVariant.value = currentOccVariant;
     }
-    currentOccVariant = (config && config.default) || variants[0].id;
-    el.occVariant.value = currentOccVariant;
-  }
-  el.frameSelect.innerHTML = "";
-  for (const fr of index.frames) {
-    const opt = document.createElement("option");
-    opt.value = String(fr.timestamp || fr.frame_id);
-    opt.textContent = `${fr.timestamp || fr.frame_id}  (occ=${fr.n_occ})`;
-    el.frameSelect.appendChild(opt);
-  }
-  if (!index.frames.length) {
-    setStatus("No frames in index.json");
-    updateFramePos();
-    return;
-  }
-  await loadFrameByIndex(0);
-  if (typeof refreshVideoList === "function") refreshVideoList();
+    el.frameSelect.innerHTML = "";
+    for (const fr of index.frames) {
+      const opt = document.createElement("option");
+      opt.value = String(fr.timestamp || fr.frame_id);
+      opt.textContent = `${fr.timestamp || fr.frame_id}  (occ=${fr.n_occ})`;
+      el.frameSelect.appendChild(opt);
+    }
+    if (!index.frames.length) {
+      if (loadStarted) loadElapsedMs = performance.now() - loadStarted;
+  loadFinished = true;
+      loadState("场景目录", "没有帧");
+      setStatus("No frames in index.json");
+      updateFramePos();
+      return;
+    }
+    await loadFrameByIndex(0);
+    if (typeof refreshVideoList === "function") refreshVideoList();
+  } catch (error) { loadFailure(error, signal); }
 }
 
 async function boot() {
-  applyProfile(await fetchJson("/api/config"));
+  applyProfile();
+  if (mongoSource) {
+    const { connectGss } = await import("./gss.js");
+    await connectGss({ select: el.clipSelect, load: clip => loadClip(clip.id, clip.url), fetchJson, status: setStatus });
+    return;
+  }
+  if (!externalSource) {
+    try { applyProfile(await fetchJson(occUrl("/api/config"))); }
+    catch (e) { setStatus(`config fallback: ${e}`); }
+  }
+  if (externalSource) {
+    if (!sceneRoot) throw new Error("An external scene URL is required.");
+    const sceneURL = new URL(sceneRoot, location.href);
+    if (sceneURL.origin !== location.origin) throw new Error("External scenes must use the same origin.");
+    if (el.clipSelect) {
+      el.clipSelect.replaceChildren(new Option("Selected scene", "external"));
+      el.clipSelect.disabled = true;
+    }
+    await loadClip("external", sceneRoot);
+    return;
+  }
   try {
-    const cat = await fetchJson("/api/clips");
+    const cat = await fetchJson(occUrl("/api/clips"));
     clipsCatalog = cat.clips || [];
     const preferred =
-      (sceneRoot && sceneRoot.replace(/^\/scenes\//, "").replace(/^\/scene\/?/, "")) ||
+      clipIdFromScene(sceneRoot) ||
       cat.default_clip ||
       (clipsCatalog[0] && clipsCatalog[0].id);
     if (el.clipSelect) {
@@ -1762,39 +2089,28 @@ async function boot() {
   } catch (e) {
     console.warn(" /api/clips unavailable, fallback single scene", e);
   }
-  // fallback: legacy ?scene=/scene
-  if (!sceneRoot) sceneRoot = "/scene";
-  index = await fetchJson(`${sceneRoot}/index.json`);
-  if (!index.clip && index.clip_id) index.clip = index.clip_id;
-  await loadStaticAggFromIndex();
-  el.frameSelect.innerHTML = "";
-  for (const fr of index.frames) {
-    const opt = document.createElement("option");
-    opt.value = String(fr.timestamp || fr.frame_id);
-    opt.textContent = `${fr.timestamp || fr.frame_id}  (occ=${fr.n_occ})`;
-    el.frameSelect.appendChild(opt);
-  }
-  if (!index.frames.length) {
-    setStatus("No frames in index.json");
-    return;
-  }
-  await loadFrameByIndex(0);
+  // Legacy single scenes use the same loading path.
+  await loadClip("legacy", sceneRoot || occUrl("/scene"));
 }
 
+document.getElementById("btnRetry").addEventListener("click", () => {
+  if (index?.frames?.length) loadFrameByIndex(frameIndex);
+  else location.reload();
+});
 el.frameSelect.addEventListener("change", async () => {
+  if (!index?.frames) return;
   const i = index.frames.findIndex(
     (f) => String(f.timestamp || f.frame_id) === String(el.frameSelect.value)
   );
   if (i >= 0) await loadFrameByIndex(i);
 });
 if (el.occVariant) {
-    await loadStaticAggFromIndex();
   el.occVariant.addEventListener("change", async () => {
     currentOccVariant = el.occVariant.value;
     await loadFrameByIndex(frameIndex);
   });
 }
-if (el.clipSelect) {
+if (el.clipSelect && !mongoSource) {
   el.clipSelect.addEventListener("change", async () => {
     await loadClip(el.clipSelect.value);
   });
@@ -1817,9 +2133,18 @@ window.addEventListener("keydown", (e) => {
     loadFrameByIndex(frameIndex + 1);
   }
 });
+el.occStyle.addEventListener("change", buildOccMesh);
 el.togOcc.addEventListener("change", () => {
   if (occMesh) occMesh.visible = el.togOcc.checked;
 });
+if (el.ptSource) {
+  el.ptSource.addEventListener("change", async () => {
+    clipAggFitted = false;
+    if (index && index.frames && index.frames.length) {
+      await loadFrameByIndex(frameIndex);
+    }
+  });
+}
 el.togPts.addEventListener("change", () => {
   if (pointsObj) {
     pointsObj.visible = el.togPts.checked;
@@ -1955,7 +2280,7 @@ function onColorOrFilterChange() {
 }
 
 if (el.colorMode) el.colorMode.addEventListener("change", onColorOrFilterChange);
-for (const id of ["togDyn", "togSta", "togFree", "togNoise", "togLid1", "togLid2", "togLid14"]) {
+for (const id of ["togDyn", "togSta", "togFree", "togNoise", "togC5Dyn", "togC5Sta", "togC5Noise", "togC5Drv", "togC5Ndrv", "togLid1", "togLid2", "togLid14"]) {
   if (el[id]) el[id].addEventListener("change", onColorOrFilterChange);
 }
 if (el.btnApplyRoi) {
@@ -1993,6 +2318,9 @@ readRoiFromInputs();
 updateRoiHelper();
 
 let vidPollTimer = null;
+// Video export requires a local scene package and serve.py. An external data
+// provider only promises scene reads, so do not offer unavailable operations.
+if (externalSource) el.btnExportVid?.closest(".row")?.setAttribute("hidden", "");
 
 function setVidStatus(msg) {
   if (el.vidStatus) el.vidStatus.textContent = msg || "";
@@ -2005,10 +2333,10 @@ function currentClipId() {
 }
 
 async function refreshVideoList() {
-  if (!el.vidList) return;
+  if (externalSource || !el.vidList) return;
   try {
     const cid = currentClipId();
-    const r = await fetch(`/api/video/list?clip_id=${encodeURIComponent(cid)}`);
+    const r = await fetch(occUrl(`/api/video/list?clip_id=${encodeURIComponent(cid)}`));
     const data = await r.json();
     const vids = data.videos || [];
     if (!vids.length) {
@@ -2018,7 +2346,7 @@ async function refreshVideoList() {
     el.vidList.innerHTML = vids
       .map((v) => {
         const mb = (v.bytes / (1024 * 1024)).toFixed(1);
-        return `<div><a href="${v.url}" download>${v.name}</a> · ${mb} MB</div>`;
+        return `<div><a href="${occUrl(v.url)}" download>${v.name}</a> · ${mb} MB</div>`;
       })
       .join("");
   } catch (e) {
@@ -2027,9 +2355,10 @@ async function refreshVideoList() {
 }
 
 async function pollVideoJob() {
+  if (externalSource) return false;
   try {
     const cid = currentClipId();
-    const r = await fetch(`/api/video/status?clip_id=${encodeURIComponent(cid)}`);
+    const r = await fetch(occUrl(`/api/video/status?clip_id=${encodeURIComponent(cid)}`));
     const s = await r.json();
     const pct = s.n ? Math.round((100 * (s.frame || 0)) / s.n) : Math.round(100 * (s.progress || 0));
     if (s.state === "running") {
@@ -2076,7 +2405,7 @@ if (el.btnExportVid) {
         tile_w: 960,
         tile_h: 540,
       };
-      const r = await fetch("/api/video/export", {
+      const r = await fetch(occUrl("/api/video/export"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
@@ -2105,12 +2434,14 @@ pollVideoJob();
 function animate() {
   requestAnimationFrame(animate);
   controls.update();
-  renderer.render(scene, camera);
+  if (renderPending) {
+    renderPending = false;
+    renderer.render(scene, camera);
+  }
 }
 animate();
 
 boot().catch((e) => {
   console.error(e);
-  setStatus(String(e));
-  el.sceneInfo.textContent = String(e);
+  loadFailure(e);
 });

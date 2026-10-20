@@ -3,8 +3,15 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Robotruck Occ Viewer</title>
+  <title>PCD/OCC Viewer</title>
+  <script>
+    if (location.pathname === "/occ") {
+      location.replace("/occ/" + location.search + location.hash);
+    }
+  </script>
   <style>
+    [hidden] { display: none !important; }
+    #dataset { max-width: 32em; }
     :root {
       --bg: #0e1116;
       --panel: #171b22;
@@ -50,6 +57,7 @@
       flex: 1 1 160px; min-width: 0;
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     }
+    #loadProgress { white-space: pre-line; overflow-wrap: anywhere; line-height: 1.6; margin-bottom: 8px; color: var(--text); font-weight: 500; }
     label.ctrl { display: inline-flex; gap: 6px; align-items: center; color: var(--muted); white-space: nowrap; }
     label.ctrl input[type="range"] { width: 112px; min-width: 80px; cursor: pointer; }
     .range-value { min-width: 34px; color: var(--text); font-variant-numeric: tabular-nums; }
@@ -74,6 +82,7 @@
     }
     #view { position: relative; min-height: 0; min-width: 0; border-right: 1px solid var(--border); overflow: hidden; }
     #canvas-wrap { position: absolute; inset: 0; }
+    #canvas-wrap canvas { display: block; width: 100%; height: 100%; }
     #axis-legend {
       position: absolute; left: 12px; bottom: 12px; z-index: 2;
       background: rgba(15,18,24,0.88); border: 1px solid var(--border);
@@ -112,6 +121,7 @@
     .cam-card .stage {
       position: relative; width: 100%; background: #000; height: 320px; cursor: zoom-in;
     }
+    .cam-card img.base { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
     .cam-card canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
     .legend {
       display: grid; grid-template-columns: 1fr 1fr; gap: 4px 8px;
@@ -157,9 +167,20 @@
   <div id="app">
     <header>
       <div class="header-top">
-        <h1>Robotruck Occ Viewer</h1>
+        <h1>PCD/OCC Viewer</h1>
         <span class="meta" id="titleMeta" title="">—</span>
       </div>
+      <form id="datasetForm" class="controls" hidden>
+        <input type="hidden" name="source" value="gss">
+        <a href="../">GSS 数据库</a>
+        <a id="collectionLink">查看集合</a>
+        <label class="ctrl">数据集 <select id="dataset" name="dataset"></select></label>
+        <label class="ctrl">划分 <select id="tag" name="tag"><option value="">全部</option><option>train</option><option>val</option></select></label>
+        <input id="search" name="search" type="search" placeholder="Clip ID / bag / md5" maxlength="200">
+        <button type="submit">搜索</button>
+        <span id="catalogCount" class="hint"></span>
+        <button id="more" type="button" hidden>加载更多</button>
+      </form>
       <div class="controls">
         <label class="ctrl">Clip
           <select id="clipSelect"></select>
@@ -173,33 +194,52 @@
         <button type="button" id="btnPrevFrame" title="Previous frame (←)">◀ Prev</button>
         <button type="button" id="btnNextFrame" title="Next frame (→)">Next ▶</button>
         <span class="hint" id="framePos">—</span>
-        <label class="ctrl"><input type="checkbox" id="togOcc" checked /> Occupancy</label>
-        <label class="ctrl"><input type="checkbox" id="togPts" checked /> Points</label>
+        <label class="ctrl"><input type="checkbox" id="togOcc" /> Occupancy
+          <select id="occStyle" aria-label="Occupancy rendering"><option value="points">体素中心（快速）</option><option value="cubes">立方体</option></select>
+        </label>
+        <label class="ctrl">Points
+          <select id="ptSource">
+            <option value="vehicle" selected>Current frame ROI</option>
+            <option value="clip_agg">Clip aggregate（按需加载）</option>
+          </select>
+        </label>
+        <label class="ctrl"><input type="checkbox" id="togPts" checked /> Show points</label>
         <label class="ctrl"><input type="checkbox" id="togOdBoxes" checked /> OD BBox + ID</label>
         <label class="ctrl"><input type="checkbox" id="togGrid" checked /> Ground grid</label>
         <label class="ctrl"><input type="checkbox" id="togAxes" checked /> Axes</label>
         <button id="btnFit">Reset 3D view</button>
-        <span id="status"></span>
+        <button type="button" id="btnRetry">重试加载</button>
+        <span id="status" role="status">正在连接数据源…</span>
       </div>
     </header>
     <div id="main">
       <aside id="sidebar">
         <div class="row">
           <h2>Scene</h2>
+          <div class="hint" id="loadProgress" role="status"></div>
           <div class="hint" id="sceneInfo">Loading…</div>
         </div>
         <div class="row">
           <h2>Color mode</h2>
           <label class="ctrl">Mode
             <select id="colorMode">
-              <option value="fine" selected>Fine 22-class</option>
+              <option value="coarse5" selected>Coarse 5-class</option>
+              <option value="fine">Fine 22-class</option>
               <option value="coarse">Coarse 4-class</option>
               <option value="lidar">Lidar id (points)</option>
             </select>
           </label>
           <div class="hint" style="margin-top:6px">
-            Coarse: dynamic / static / freespace / noise<br/>
+            5-class: dynamic / static / noise / drivable / non_drivable<br/>
+            4-class: dynamic / static / freespace / noise<br/>
             Lidar: 1 / 2 / 14 (points only; occ stays semantic)
+          </div>
+          <div id="coarse5Toggles" style="margin-top:8px">
+            <label class="ctrl"><input type="checkbox" id="togC5Dyn" checked /> <span style="color:#ff3326">dynamic</span></label>
+            <label class="ctrl"><input type="checkbox" id="togC5Sta" checked /> <span style="color:#ff9e00">static</span></label>
+            <label class="ctrl"><input type="checkbox" id="togC5Noise" checked /> <span style="color:#737373">noise</span></label>
+            <label class="ctrl"><input type="checkbox" id="togC5Drv" checked /> <span style="color:#33d94d">drivable</span></label>
+            <label class="ctrl"><input type="checkbox" id="togC5Ndrv" checked /> <span style="color:#4080ff">non_drivable</span></label>
           </div>
           <div id="coarseToggles" style="margin-top:8px; display:none">
             <label class="ctrl"><input type="checkbox" id="togDyn" checked /> dynamic</label>
@@ -236,7 +276,7 @@
             <button type="button" id="btnResetRoi">Reset default</button>
           </div>
           <label class="ctrl" style="margin-top:8px"><input type="checkbox" id="togRoiBox" checked /> Show ROI box</label>
-          <label class="ctrl" style="margin-top:8px"><input type="checkbox" id="togRoiClip" checked /> Clip display to ROI</label>
+          <label class="ctrl" style="margin-top:8px"><input type="checkbox" id="togRoiClip" /> Clip display to ROI</label>
         </div>
         <div class="row">
           <h2>Axes = vehicle coords</h2>
@@ -279,7 +319,7 @@
               <option value="occ" selected>Occupancy</option>
               <option value="points">Points</option>
               <option value="both">Occ + Points</option>
-              <option value="none">RGB only</option>
+              <option value="none" selected>RGB only</option>
             </select>
           </label>
           <label class="ctrl" style="margin-top:8px">FPS
@@ -327,8 +367,8 @@
             </label>
             <label class="ctrl">Point color
               <select id="projColorMode">
-                <option value="height" selected>Height</option>
-                <option value="semantic">Semantic/Lidar</option>
+                <option value="height">Height</option>
+                <option value="semantic" selected>Semantic/Lidar</option>
               </select>
             </label>
             <label class="ctrl">Point filter
@@ -375,11 +415,11 @@
   <script type="importmap">
   {
     "imports": {
-      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
-      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+      "three": "./vendor/three/three.module.js",
+      "three/addons/": "./vendor/three/examples/jsm/"
     }
   }
   </script>
-  <script type="module" src="./app.js?v=occ-fix-29"></script>
+  <script type="module" src="./app.js?v=occ-load-41"></script>
 </body>
 </html>

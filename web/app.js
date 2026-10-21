@@ -28,7 +28,7 @@ function clipIdFromScene(root) {
 let sceneRoot = occUrl((qs.get("scene") || "").replace(/\/$/, ""));
 let clipsCatalog = [];
 let frameIndex = 0;
-let currentOccVariant = "litept";
+let currentOccVariant = "default";
 
 /** Resolve asset URI relative to scene root (Mongo/S3 can swap to absolute later). */
 function assetUrl(uri, frameRelFallback = null) {
@@ -127,21 +127,10 @@ const el = {
   btnFit: document.getElementById("btnFit"),
   classLegend: document.getElementById("classLegend"),
   colorMode: document.getElementById("colorMode"),
-  coarseToggles: document.getElementById("coarseToggles"),
-  coarse5Toggles: document.getElementById("coarse5Toggles"),
+  groupToggles: document.getElementById("groupToggles"),
   lidarToggles: document.getElementById("lidarToggles"),
-  togDyn: document.getElementById("togDyn"),
-  togSta: document.getElementById("togSta"),
-  togFree: document.getElementById("togFree"),
-  togNoise: document.getElementById("togNoise"),
-  togC5Dyn: document.getElementById("togC5Dyn"),
-  togC5Sta: document.getElementById("togC5Sta"),
-  togC5Noise: document.getElementById("togC5Noise"),
-  togC5Drv: document.getElementById("togC5Drv"),
-  togC5Ndrv: document.getElementById("togC5Ndrv"),
-  togLid1: document.getElementById("togLid1"),
-  togLid2: document.getElementById("togLid2"),
-  togLid14: document.getElementById("togLid14"),
+  colorModeHint: document.getElementById("colorModeHint"),
+  roiDefaultHint: document.getElementById("roiDefaultHint"),
   roiX0: document.getElementById("roiX0"),
   roiX1: document.getElementById("roiX1"),
   roiY0: document.getElementById("roiY0"),
@@ -198,55 +187,226 @@ let framePtLidar = null;
 let staticAgg = null;
 let clipAggFitted = false;
 let roiHelper = null;
-let roi = { x0: -24, x1: 24, y0: -25, y1: 150, z0: -5, z1: 3 };
-let Cdyn, Cfree, Csta, Ccol, Cord, nFine;
-let Lcol = { 1: [40, 180, 255], 2: [40, 220, 40], 14: [255, 40, 40] };
-let C5dyn, C5sta, C5drv, C5ndrv, C5col, C5ord;
-let labelEncoding = "fine22";
+let roi = { x0: -50, x1: 50, y0: -50, y1: 50, z0: -5, z1: 5 };
+let nFine = 0;
+let Lcol = {};
+let lidarIdsList = [];
+/** Coarse color modes from taxonomy: any taxonomy key beside fine/lidar_ids
+ *  with order + colors_rgb + fine_ids (or fine_to_coarse) becomes one group.
+ *  raw_ids maps group names to raw label values for packages exported with
+ *  group labels instead of fine ids. */
+let labelGroups = [];
+let groupById = new Map();
+/** Fine ids of the first group's "dynamic" member (clip-aggregate split). */
+let dynFineIds = new Set();
+/** "fine": labels are fine ids. "raw": labels are a group's raw_ids values. */
+let labelEncoding = "fine";
+let uiConfig = { default_color_mode: "", occ_variants: [], point_filters: [], height_range: [-3, 3] };
+let previewConfig = { enabled: false, prefix: "preview_" };
+let gssConfig = {};
+let toggleBoxes = new Map(); // groupId -> Map(name -> checkbox)
+let lidarBoxes = new Map(); // lidar id -> checkbox
+let colorModeDefault = "fine";
+let roiDefault = null; // last profile-applied ROI inputs (untouched detection)
+let heightRangeDefault = null;
 
-const C5_DEFAULT = {
-  order: ["dynamic", "static", "noise", "drivable", "non_drivable"],
-  colors_rgb: {
-    dynamic: [255, 51, 38],
-    static: [255, 158, 0],
-    noise: [115, 115, 115],
-    drivable: [51, 217, 77],
-    non_drivable: [64, 128, 255],
-  },
-  fine_ids: {
-    dynamic: [0, 1, 2, 3, 4, 5, 6, 11, 12],
-    static: [7, 8, 9, 10, 13, 14, 15, 16],
-    drivable: [17, 18],
-    non_drivable: [19, 20, 21],
-  },
-};
-
-function applyCoarse5(c5) {
-  const src = c5 || C5_DEFAULT;
-  C5dyn = new Set((src.fine_ids && src.fine_ids.dynamic) || C5_DEFAULT.fine_ids.dynamic);
-  C5sta = new Set((src.fine_ids && src.fine_ids.static) || C5_DEFAULT.fine_ids.static);
-  C5drv = new Set((src.fine_ids && src.fine_ids.drivable) || C5_DEFAULT.fine_ids.drivable);
-  C5ndrv = new Set((src.fine_ids && src.fine_ids.non_drivable) || C5_DEFAULT.fine_ids.non_drivable);
-  C5col = src.colors_rgb || C5_DEFAULT.colors_rgb;
-  C5ord = src.order || C5_DEFAULT.order;
+function buildLabelGroup(id, g = {}) {
+  const order = g.order || g.names || [];
+  const colors = Array.isArray(g.colors_rgb)
+    ? Object.fromEntries(order.map((name, i) => [name, g.colors_rgb[i]]))
+    : (g.colors_rgb || {});
+  let fineSets = null;
+  if (g.fine_ids) {
+    fineSets = new Map(order.map((name) => [name, new Set(g.fine_ids[name] || [])]));
+  } else if (g.fine_to_coarse) {
+    fineSets = new Map(order.map((name) => [name, new Set()]));
+    g.fine_to_coarse.forEach((gi, fid) => {
+      const name = order[gi];
+      if (name != null && fineSets.has(name)) fineSets.get(name).add(fid);
+    });
+  }
+  const raw = g.raw_ids || g.raw5_ids || null;
+  let rawSets = null;
+  let rawMax = -1;
+  if (raw) {
+    rawSets = new Map(order.map((name) => [name, new Set(raw[name] || [])]));
+    for (const set of rawSets.values()) for (const v of set) rawMax = Math.max(rawMax, v);
+  }
+  return {
+    id,
+    order,
+    colors,
+    fineSets,
+    rawSets,
+    rawMax,
+    noiseName: order.includes("noise") ? "noise" : order[order.length - 1],
+  };
 }
 
 function applyProfile(p = {}) {
-  // Both serve.py profiles and canonical scene indexes describe the taxonomy.
-  const t = p.taxonomy || {}, c = t.coarse || {}, L = t.lidar_ids || {};
-  Cord = c.order || c.names || ["dynamic", "static", "freespace", "noise"];
-  const ids = name => c.fine_ids?.[name] || c.fine_to_coarse?.flatMap((group, id) => Cord[group] === name ? [id] : []);
-  Cdyn = new Set(ids("dynamic") || C5_DEFAULT.fine_ids.dynamic);
-  Csta = new Set(ids("static") || C5_DEFAULT.fine_ids.static);
-  Cfree = new Set(ids("freespace") || [...C5_DEFAULT.fine_ids.drivable, ...C5_DEFAULT.fine_ids.non_drivable]);
-  Ccol = Array.isArray(c.colors_rgb) ? Object.fromEntries(Cord.map((name, i) => [name, c.colors_rgb[i]]))
-    : c.colors_rgb || { dynamic: [230, 64, 64], static: [64, 160, 255], freespace: [72, 200, 96], noise: [160, 160, 160] };
-  Lcol = Array.isArray(L.colors_rgb) ? Object.fromEntries(L.ids.map((id, i) => [id, L.colors_rgb[i]]))
-    : L.colors_rgb || { 1: [40, 180, 255], 2: [40, 220, 40], 14: [255, 40, 40] };
-  nFine = t.fine?.n || 22;
-  applyCoarse5(t.coarse5);
-  const r = p.roi || p.defaults?.roi || { x: [-24, 24], y: [-25, 150], z: [-5, 3] };
-  roi = { x0: r.x[0], x1: r.x[1], y0: r.y[0], y1: r.y[1], z0: r.z[0], z1: r.z[1] };
+  // Format YAML and canonical scene indexes share the same profile shape;
+  // each call merges one source over the current state (scene index wins).
+  const t = p.taxonomy || {};
+  if (t.fine && t.fine.n) nFine = t.fine.n;
+  for (const [id, g] of Object.entries(t)) {
+    if (id === "fine" || id === "lidar_ids" || !g || typeof g !== "object") continue;
+    const group = buildLabelGroup(id, g);
+    const i = labelGroups.findIndex((x) => x.id === id);
+    if (i >= 0) labelGroups[i] = group;
+    else labelGroups.push(group);
+  }
+  groupById = new Map(labelGroups.map((g) => [g.id, g]));
+  const L = t.lidar_ids;
+  if (L && L.colors_rgb) {
+    Lcol = Array.isArray(L.colors_rgb)
+      ? Object.fromEntries((L.ids || []).map((id, i) => [id, L.colors_rgb[i]]))
+      : L.colors_rgb;
+    lidarIdsList = Object.keys(Lcol).map(Number).sort((a, b) => a - b);
+  }
+  dynFineIds = new Set();
+  for (const g of labelGroups) {
+    const set = g.fineSets && g.fineSets.get("dynamic");
+    if (set && set.size) {
+      dynFineIds = set;
+      break;
+    }
+  }
+  const r = p.roi || (p.defaults && p.defaults.roi);
+  if (r && r.x && r.y && r.z) {
+    roi = { x0: r.x[0], x1: r.x[1], y0: r.y[0], y1: r.y[1], z0: r.z[0], z1: r.z[1] };
+  }
+  if (p.ui) uiConfig = { ...uiConfig, ...p.ui };
+  if (p.point_preview) previewConfig = { ...previewConfig, ...p.point_preview };
+  if (p.gss) gssConfig = { ...gssConfig, ...p.gss };
+  if (!labelGroups.some((g) => g.rawSets)) labelEncoding = "fine";
+  buildFormatUi();
+}
+
+function _hasOption(sel, value) {
+  return [...sel.options].some((o) => o.value === value);
+}
+
+/** Rebuild every config-driven widget: color modes, group/lidar toggles,
+ *  hints, point filters, ROI and height-range defaults. User-edited values
+ *  survive rebuilds; untouched defaults track the latest profile. */
+function buildFormatUi() {
+  if (el.colorMode) {
+    const sel = el.colorMode;
+    const prev = sel.value;
+    const prevDefault = colorModeDefault;
+    sel.innerHTML = "";
+    sel.appendChild(new Option(nFine ? `Fine ${nFine}-class` : "Fine", "fine"));
+    for (const g of labelGroups) {
+      const name = g.id[0].toUpperCase() + g.id.slice(1);
+      sel.appendChild(new Option(`${name} ${g.order.length}-class`, g.id));
+    }
+    if (lidarIdsList.length) sel.appendChild(new Option("Lidar id (points)", "lidar"));
+    const configured = uiConfig.default_color_mode;
+    const nextDefault = configured && _hasOption(sel, configured) ? configured : sel.options[0].value;
+    sel.value = prev && prev !== prevDefault && _hasOption(sel, prev) ? prev : nextDefault;
+    colorModeDefault = nextDefault;
+  }
+  if (el.groupToggles) {
+    const old = toggleBoxes;
+    toggleBoxes = new Map();
+    el.groupToggles.innerHTML = "";
+    for (const g of labelGroups) {
+      const div = document.createElement("div");
+      div.dataset.group = g.id;
+      div.style.marginTop = "8px";
+      const boxes = new Map();
+      for (const name of g.order) {
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        const prev = old.get(g.id) && old.get(g.id).get(name);
+        cb.checked = prev ? prev.checked : true;
+        const c = g.colors[name] || [160, 160, 160];
+        const span = document.createElement("span");
+        span.textContent = ` ${name}`;
+        span.style.color = `rgb(${c[0]},${c[1]},${c[2]})`;
+        const label = document.createElement("label");
+        label.className = "ctrl";
+        label.append(cb, span);
+        div.appendChild(label);
+        boxes.set(name, cb);
+      }
+      el.groupToggles.appendChild(div);
+      toggleBoxes.set(g.id, boxes);
+    }
+  }
+  if (el.lidarToggles) {
+    const old = lidarBoxes;
+    lidarBoxes = new Map();
+    el.lidarToggles.innerHTML = "";
+    for (const lid of lidarIdsList) {
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      const prev = old.get(lid);
+      cb.checked = prev ? prev.checked : true;
+      const c = Lcol[lid] || [160, 160, 160];
+      const span = document.createElement("span");
+      span.textContent = ` lidar_${lid}`;
+      span.style.color = `rgb(${c[0]},${c[1]},${c[2]})`;
+      const label = document.createElement("label");
+      label.className = "ctrl";
+      label.append(cb, span);
+      el.lidarToggles.appendChild(label);
+      lidarBoxes.set(lid, cb);
+    }
+  }
+  if (el.colorModeHint) {
+    const lines = labelGroups.map((g) => `${g.id}: ${g.order.join(" / ")}`);
+    if (lidarIdsList.length) lines.push(`Lidar: ${lidarIdsList.join(" / ")} (points only; occ stays semantic)`);
+    el.colorModeHint.innerHTML = lines.join("<br/>");
+  }
+  if (el.projClassFilter && (uiConfig.point_filters || []).length) {
+    const prev = el.projClassFilter.value;
+    el.projClassFilter.innerHTML = "";
+    for (const f of uiConfig.point_filters) {
+      el.projClassFilter.appendChild(new Option(f.label || String(f.value), String(f.value)));
+    }
+    if (_hasOption(el.projClassFilter, prev)) el.projClassFilter.value = prev;
+  }
+  const hr = uiConfig.height_range;
+  if (el.projHeightMin && el.projHeightMax && Array.isArray(hr) && hr.length === 2) {
+    const untouched = !heightRangeDefault ||
+      (Number(el.projHeightMin.value) === heightRangeDefault[0] &&
+        Number(el.projHeightMax.value) === heightRangeDefault[1]);
+    if (untouched) {
+      el.projHeightMin.value = hr[0];
+      el.projHeightMax.value = hr[1];
+    }
+    heightRangeDefault = hr;
+  }
+  if (el.roiX0) {
+    const cur = [el.roiX0, el.roiX1, el.roiY0, el.roiY1, el.roiZ0, el.roiZ1].map((i) => Number(i.value));
+    const untouched = !roiDefault || roiDefault.every((v, i) => v === cur[i]);
+    if (untouched) {
+      el.roiX0.value = roi.x0;
+      el.roiX1.value = roi.x1;
+      el.roiY0.value = roi.y0;
+      el.roiY1.value = roi.y1;
+      el.roiZ0.value = roi.z0;
+      el.roiZ1.value = roi.z1;
+    }
+    roiDefault = [roi.x0, roi.x1, roi.y0, roi.y1, roi.z0, roi.z1];
+    if (el.roiDefaultHint) {
+      el.roiDefaultHint.textContent = `Default [${roi.x0},${roi.x1}]×[${roi.y0},${roi.y1}]×[${roi.z0},${roi.z1}]`;
+    }
+  }
+  syncColorModeUi();
+  updateRoiHelper();
+}
+
+function groupVisible(g, name) {
+  const boxes = toggleBoxes.get(g.id);
+  const cb = boxes && boxes.get(name);
+  return !cb || cb.checked;
+}
+
+function lidarVisible(lid) {
+  const cb = lidarBoxes.get(lid);
+  return !cb || cb.checked;
 }
 
 /** Lightbox state */
@@ -661,10 +821,13 @@ async function loadStaticAggFromIndex(signal) {
   if (!sa || !sa.xyz_map || !sa.labels) { loadState("聚合点云", "无数据", signal); return; }
   const previewName = (uri) => {
     const i = String(uri).lastIndexOf("/") + 1;
-    return `${uri.slice(0, i)}preview_${uri.slice(i)}`;
+    return `${uri.slice(0, i)}${previewConfig.prefix}${uri.slice(i)}`;
   };
+  // Local serve.py can serve strided previews of the aggregate (format
+  // config `point_preview`); external providers are read as-is.
+  const usePreview = !externalSource && previewConfig.enabled;
   const urls = [sa.xyz_map, sa.labels, sa.lidar_id].map(asset =>
-    asset?.uri ? assetUrl(externalSource ? asset.uri : previewName(asset.uri)) : null);
+    asset?.uri ? assetUrl(usePreview ? previewName(asset.uri) : asset.uri) : null);
   const buffers = await fetchGroup("聚合点云", urls, signal, 2);
   if (!buffers || signal.aborted) return;
   const [xyzBuf, labBuf, lidBuf] = buffers;
@@ -687,40 +850,33 @@ async function loadStaticAggFromIndex(signal) {
 
 function inferLabelEncoding(labels) {
   if (!labels || !labels.length) return labelEncoding;
+  const rg = labelGroups.find((g) => g.rawSets);
+  if (!rg) {
+    labelEncoding = "fine";
+    return labelEncoding;
+  }
   let max = 0;
   for (let i = 0; i < labels.length; i++) {
     if (labels[i] > max) max = labels[i];
-    if (max > 4) break;
+    if (max > rg.rawMax) break;
   }
-  labelEncoding = max <= 4 ? "c5" : "fine22";
+  labelEncoding = max <= rg.rawMax ? "raw" : "fine";
   return labelEncoding;
 }
 
-function fineToCoarse(lab) {
+function labelToGroupName(g, lab) {
   const i = lab | 0;
-  if (i < 0 || i >= nFine) return "noise";
-  if (Cdyn.has(i)) return "dynamic";
-  if (Cfree.has(i)) return "freespace";
-  if (Csta.has(i)) return "static";
-  return "noise";
+  if (labelEncoding === "raw" && g.rawSets) {
+    for (const name of g.order) if (g.rawSets.get(name).has(i)) return name;
+    return g.noiseName;
+  }
+  if (i < 0 || i === 255 || (nFine && i >= nFine)) return g.noiseName;
+  if (g.fineSets) for (const name of g.order) if (g.fineSets.get(name).has(i)) return name;
+  return g.noiseName;
 }
 
-function labelToC5(lab) {
-  const i = lab | 0;
-  if (labelEncoding === "c5") {
-    if (i === 0) return "dynamic";
-    if (i === 1) return "static";
-    if (i === 2) return "noise";
-    if (i === 3) return "drivable";
-    if (i === 4) return "non_drivable";
-    return "noise";
-  }
-  if (i < 0 || i === 255 || (nFine && i >= nFine)) return "noise";
-  if (C5dyn && C5dyn.has(i)) return "dynamic";
-  if (C5sta && C5sta.has(i)) return "static";
-  if (C5drv && C5drv.has(i)) return "drivable";
-  if (C5ndrv && C5ndrv.has(i)) return "non_drivable";
-  return "noise";
+function activeLabelGroup() {
+  return groupById.get(colorModeValue()) || null;
 }
 
 function colorModeValue() {
@@ -743,30 +899,6 @@ function readRoiFromInputs() {
   const [z0, z1] = a(el.roiZ0, el.roiZ1);
   roi = { x0, x1, y0, y1, z0, z1 };
   return roi;
-}
-
-function coarseVisible(name) {
-  if (name === "dynamic") return !el.togDyn || el.togDyn.checked;
-  if (name === "static") return !el.togSta || el.togSta.checked;
-  if (name === "freespace") return !el.togFree || el.togFree.checked;
-  if (name === "noise") return !el.togNoise || el.togNoise.checked;
-  return true;
-}
-
-function coarse5Visible(name) {
-  if (name === "dynamic") return !el.togC5Dyn || el.togC5Dyn.checked;
-  if (name === "static") return !el.togC5Sta || el.togC5Sta.checked;
-  if (name === "noise") return !el.togC5Noise || el.togC5Noise.checked;
-  if (name === "drivable") return !el.togC5Drv || el.togC5Drv.checked;
-  if (name === "non_drivable") return !el.togC5Ndrv || el.togC5Ndrv.checked;
-  return true;
-}
-
-function lidarVisible(lid) {
-  if (lid === 1) return !el.togLid1 || el.togLid1.checked;
-  if (lid === 2) return !el.togLid2 || el.togLid2.checked;
-  if (lid === 14) return !el.togLid14 || el.togLid14.checked;
-  return true;
 }
 
 function normalizeClassColors(raw) {
@@ -815,13 +947,9 @@ function resolveClassColors(meta) {
 }
 
 function colorFromLabel(label) {
-  const mode = colorModeValue();
-  if (mode === "coarse5") {
-    const c = (C5col && C5col[labelToC5(label)]) || C5_DEFAULT.colors_rgb.noise;
-    return new THREE.Color(c[0] / 255, c[1] / 255, c[2] / 255);
-  }
-  if (mode === "coarse") {
-    const c = Ccol[fineToCoarse(label)] || Ccol.noise;
+  const grp = activeLabelGroup();
+  if (grp) {
+    const c = grp.colors[labelToGroupName(grp, label)] || grp.colors[grp.noiseName] || [160, 160, 160];
     return new THREE.Color(c[0] / 255, c[1] / 255, c[2] / 255);
   }
   const i = label | 0;
@@ -838,13 +966,9 @@ function colorFromLidar(lid) {
 }
 
 function rgbCss(label) {
-  const mode = colorModeValue();
-  if (mode === "coarse5") {
-    const c = (C5col && C5col[labelToC5(label)]) || C5_DEFAULT.colors_rgb.noise;
-    return `rgb(${c[0]},${c[1]},${c[2]})`;
-  }
-  if (mode === "coarse") {
-    const c = Ccol[fineToCoarse(label)] || Ccol.noise;
+  const grp = activeLabelGroup();
+  if (grp) {
+    const c = grp.colors[labelToGroupName(grp, label)] || grp.colors[grp.noiseName] || [160, 160, 160];
     return `rgb(${c[0]},${c[1]},${c[2]})`;
   }
   const i = label | 0;
@@ -862,8 +986,11 @@ function rgbCssLidar(lid) {
 
 function syncColorModeUi() {
   const mode = colorModeValue();
-  if (el.coarse5Toggles) el.coarse5Toggles.style.display = mode === "coarse5" ? "block" : "none";
-  if (el.coarseToggles) el.coarseToggles.style.display = mode === "coarse" ? "block" : "none";
+  if (el.groupToggles) {
+    for (const div of el.groupToggles.children) {
+      div.style.display = div.dataset.group === mode ? "block" : "none";
+    }
+  }
   if (el.lidarToggles) el.lidarToggles.style.display = mode === "lidar" ? "block" : "none";
   renderClassLegend();
 }
@@ -871,20 +998,10 @@ function syncColorModeUi() {
 function renderClassLegend() {
   if (!el.classLegend) return;
   const mode = colorModeValue();
-  if (mode === "coarse5") {
-    const names = C5ord || C5_DEFAULT.order;
-    el.classLegend.innerHTML = names.map((name) => {
-      const c = (C5col && C5col[name]) || C5_DEFAULT.colors_rgb[name] || [160, 160, 160];
-      return `<div class="legend-item" title="${name}">
-        <i class="legend-swatch" style="background:rgb(${c[0]},${c[1]},${c[2]})"></i>
-        <span>${name}</span>
-      </div>`;
-    }).join("");
-    return;
-  }
-  if (mode === "coarse") {
-    el.classLegend.innerHTML = Cord.map((name) => {
-      const c = Ccol[name];
+  const grp = activeLabelGroup();
+  if (grp) {
+    el.classLegend.innerHTML = grp.order.map((name) => {
+      const c = grp.colors[name] || [160, 160, 160];
       return `<div class="legend-item" title="${name}">
         <i class="legend-swatch" style="background:rgb(${c[0]},${c[1]},${c[2]})"></i>
         <span>${name}</span>
@@ -893,9 +1010,9 @@ function renderClassLegend() {
     return;
   }
   if (mode === "lidar") {
-    el.classLegend.innerHTML = [1, 2, 14]
+    el.classLegend.innerHTML = lidarIdsList
       .map((lid) => {
-        const c = Lcol[lid];
+        const c = Lcol[lid] || [160, 160, 160];
         return `<div class="legend-item" title="lidar_${lid}">
           <i class="legend-swatch" style="background:rgb(${c[0]},${c[1]},${c[2]})"></i>
           <span>lidar_${lid}</span>
@@ -978,11 +1095,10 @@ function buildOccMesh() {
   const roiOn = !useClipAggregate() && !!(el.togRoiClip && el.togRoiClip.checked);
   const rx0 = roi.x0, rx1 = roi.x1, ry0 = roi.y0, ry1 = roi.y1, rz0 = roi.z0, rz1 = roi.z1;
   const ox = origin[0], oy = origin[1], oz = origin[2];
+  const grp = activeLabelGroup();
   const vis = new Uint8Array(256);
-  if (mode === "coarse" || mode === "coarse5") {
-    for (let lab = 0; lab < 256; lab++) {
-      vis[lab] = mode === "coarse" ? coarseVisible(fineToCoarse(lab)) : coarse5Visible(labelToC5(lab));
-    }
+  if (grp) {
+    for (let lab = 0; lab < 256; lab++) vis[lab] = groupVisible(grp, labelToGroupName(grp, lab));
   } else {
     vis.fill(1);
   }
@@ -1139,11 +1255,10 @@ function buildPoints() {
   // Hot loop over every point: hoist DOM state, precompute visibility LUTs.
   const roiOn = !useClipAggregate() && !!(el.togRoiClip && el.togRoiClip.checked);
   const rx0 = roi.x0, rx1 = roi.x1, ry0 = roi.y0, ry1 = roi.y1, rz0 = roi.z0, rz1 = roi.z1;
+  const grp = activeLabelGroup();
   const vis = new Uint8Array(256);
-  if (mode === "coarse" || mode === "coarse5") {
-    for (let lab = 0; lab < 256; lab++) {
-      vis[lab] = mode === "coarse" ? coarseVisible(fineToCoarse(lab)) : coarse5Visible(labelToC5(lab));
-    }
+  if (grp) {
+    for (let lab = 0; lab < 256; lab++) vis[lab] = groupVisible(grp, labelToGroupName(grp, lab));
   } else {
     vis.fill(1);
   }
@@ -1280,7 +1395,7 @@ function projectOccCubes(cam, maxCells = 60000) {
     let yn = yc / zc;
     if (useDist) {
       const r2 = xn * xn + yn * yn;
-      // Guard extreme radtan (e.g. camera17 k3≈-3.8) outside reliable FOV.
+      // Guard extreme radtan (e.g. k3≈-3.8 on some rigs) outside reliable FOV.
       if (r2 > 1.2) return false;
       const r4 = r2 * r2;
       const radial = 1 + k1 * r2 + k2 * r4 + k3 * (r4 * r2);
@@ -1315,7 +1430,7 @@ function projectOccCubes(cam, maxCells = 60000) {
     if (!projectTo(0.5 * (xa + xb), 0.5 * (ya + yb), 0.5 * (za + zb))) continue;
     if (scratch.z < nearZ) continue;
     // Center must land inside the image — otherwise corner hulls become
-    // huge radial wings (esp. camera17 / strong radtan).
+    // huge radial wings (esp. strong radtan wide cams).
     if (scratch.u < 0 || scratch.u >= w || scratch.v < 0 || scratch.v >= h) continue;
 
     let zSum = 0;
@@ -1337,7 +1452,7 @@ function projectOccCubes(cam, maxCells = 60000) {
     if (!ok) continue;
     if (uMax - uMin > maxSpan || vMax - vMin > maxSpan) continue;
     // Drop cubes whose silhouette is far larger than a voxel at that depth
-    // (camera17 / strong radtan otherwise paints huge wing shards).
+    // (strong radtan otherwise paints huge wing shards).
     const zMean = zSum / 8;
     const expect = (2.5 * v * fxBound) / Math.max(zMean, nearZ);
     if (uMax - uMin > Math.max(24, 3 * expect) || vMax - vMin > Math.max(24, 3 * expect)) {
@@ -1550,11 +1665,15 @@ function drawProjectionOnCanvas(canvas, img, cam, mode, ptMinPx = 1) {
       const px = Math.max(1, sourcePx * scale);
       const cmode = colorModeValue();
       const heightMode = el.projColorMode && el.projColorMode.value === "height";
-      const coneOnly = el.projClassFilter && el.projClassFilter.value === "10";
-      let zMin = el.projHeightMin ? Number(el.projHeightMin.value) : -2.2;
-      let zMax = el.projHeightMax ? Number(el.projHeightMax.value) : 0.5;
-      if (!Number.isFinite(zMin)) zMin = -2.2;
-      if (!Number.isFinite(zMax)) zMax = 0.5;
+      const filterValue = el.projClassFilter ? el.projClassFilter.value : "all";
+      const activeFilter = (uiConfig.point_filters || []).find((f) => String(f.value) === filterValue);
+      const hl = activeFilter && activeFilter.highlight_rgb;
+      const highlightCss = hl ? `rgb(${hl[0]},${hl[1]},${hl[2]})` : null;
+      const hr = uiConfig.height_range || [-3, 3];
+      let zMin = el.projHeightMin ? Number(el.projHeightMin.value) : hr[0];
+      let zMax = el.projHeightMax ? Number(el.projHeightMax.value) : hr[1];
+      if (!Number.isFinite(zMin)) zMin = hr[0];
+      if (!Number.isFinite(zMax)) zMax = hr[1];
       if (zMax <= zMin) zMax = zMin + 0.1;
       // Per-label fill styles are constant for the whole batch — build once
       // instead of re-reading the DOM and formatting strings per point.
@@ -1571,11 +1690,10 @@ function drawProjectionOnCanvas(canvas, img, cam, mode, ptMinPx = 1) {
       for (const p of pts) {
         // Do not add hidden opacity: dense full-frame deskew points otherwise
         // cover the RGB image and make a successfully loaded frame look blank.
-        ctx.fillStyle = coneOnly
-          ? "rgb(255,80,0)"
-          : heightMode
-          ? heightRgbCss(p.zVeh, zMin, zMax)
-          : (cmode === "lidar" ? lidStyles[p.lid || 0] : labStyles[p.lab]);
+        ctx.fillStyle = highlightCss
+          || (heightMode
+            ? heightRgbCss(p.zVeh, zMin, zMax)
+            : (cmode === "lidar" ? lidStyles[p.lid || 0] : labStyles[p.lab]));
         ctx.fillRect(
           ox + p.u * scale - px * 0.5,
           oy + p.v * scale - px * 0.5,
@@ -1823,7 +1941,7 @@ async function loadFrame(frameEntry, signal) {
         // Keep frame dynamic only — static comes from clip static_agg + ego_pose.
         const dynIdx = [];
         for (let i = 0; i < rawLab.length; i++) {
-          if (Cdyn.has(rawLab[i] | 0)) dynIdx.push(i);
+          if (dynFineIds.has(rawLab[i] | 0)) dynIdx.push(i);
         }
         frameDynXYZ = new Float32Array(dynIdx.length * 3);
         frameDynLab = new Uint8Array(dynIdx.length);
@@ -2009,7 +2127,10 @@ async function loadClip(clipId, root) {
     if (el.occVariant) {
       const config = index.occupancy_variants;
       el.occVariant.innerHTML = "";
-      const variants = (config && config.variants) || [{ id: "litept", name: "LitePT dynamic" }];
+      const variants = (config && config.variants) ||
+        (uiConfig.occ_variants && uiConfig.occ_variants.length
+          ? uiConfig.occ_variants
+          : [{ id: "default", name: "default" }]);
       for (const variant of variants) {
         const opt = document.createElement("option");
         opt.value = variant.id;
@@ -2041,14 +2162,16 @@ async function loadClip(clipId, root) {
 
 async function boot() {
   applyProfile();
+  // Best-effort in every mode: the server format profile is the base layer;
+  // an external scene index may still override it later in loadClip.
+  let formatConfig = null;
+  try { formatConfig = await fetchJson(occUrl("/api/config")); }
+  catch (e) { if (!externalSource) setStatus(`config fallback: ${e}`); }
+  if (formatConfig) applyProfile(formatConfig);
   if (mongoSource) {
     const { connectGss } = await import("./gss.js");
-    await connectGss({ select: el.clipSelect, load: clip => loadClip(clip.id, clip.url), fetchJson, status: setStatus });
+    await connectGss({ select: el.clipSelect, load: clip => loadClip(clip.id, clip.url), fetchJson, status: setStatus, config: formatConfig });
     return;
-  }
-  if (!externalSource) {
-    try { applyProfile(await fetchJson(occUrl("/api/config"))); }
-    catch (e) { setStatus(`config fallback: ${e}`); }
   }
   if (externalSource) {
     if (!sceneRoot) throw new Error("An external scene URL is required.");
@@ -2280,9 +2403,10 @@ function onColorOrFilterChange() {
 }
 
 if (el.colorMode) el.colorMode.addEventListener("change", onColorOrFilterChange);
-for (const id of ["togDyn", "togSta", "togFree", "togNoise", "togC5Dyn", "togC5Sta", "togC5Noise", "togC5Drv", "togC5Ndrv", "togLid1", "togLid2", "togLid14"]) {
-  if (el[id]) el[id].addEventListener("change", onColorOrFilterChange);
-}
+// Group/lidar checkboxes are built dynamically from the format profile,
+// so listen on their containers instead of fixed element ids.
+if (el.groupToggles) el.groupToggles.addEventListener("change", onColorOrFilterChange);
+if (el.lidarToggles) el.lidarToggles.addEventListener("change", onColorOrFilterChange);
 if (el.btnApplyRoi) {
   el.btnApplyRoi.addEventListener("click", () => {
     readRoiFromInputs();

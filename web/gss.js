@@ -1,5 +1,5 @@
 // Mongo stays in GSS. This module only connects its read API to the existing viewer.
-export async function connectGss({ select, load, fetchJson, status }) {
+export async function connectGss({ select, load, fetchJson, status, config }) {
   const form = document.getElementById("datasetForm");
   const dataset = form.elements.dataset, tag = form.elements.tag, search = form.elements.search;
   const more = document.getElementById("more"), count = document.getElementById("catalogCount");
@@ -10,7 +10,8 @@ export async function connectGss({ select, load, fetchJson, status }) {
   if (!datasets.length) { status("当前可访问的数据库中没有 OCC 数据集。"); return; }
   if (datasets.some(item => item.url === params.get("dataset"))) dataset.value = params.get("dataset");
   else {
-    const dft = datasets.find(item => item.url.includes("/occ_data_clips_lidar14_0813/"));
+    const dftName = config?.gss?.default_dataset;
+    const dft = dftName ? datasets.find(item => item.url.includes(dftName)) : null;
     if (dft) dataset.value = dft.url;
   }
   tag.value = ["train", "val"].includes(params.get("tag")) ? params.get("tag") : "";

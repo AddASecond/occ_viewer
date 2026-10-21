@@ -189,7 +189,7 @@
           <select id="frameSelect"></select>
         </label>
         <label class="ctrl">OCC Algorithm
-          <select id="occVariant"><option value="litept">LitePT dynamic</option></select>
+          <select id="occVariant"><option value="default">default</option></select>
         </label>
         <button type="button" id="btnPrevFrame" title="Previous frame (←)">◀ Prev</button>
         <button type="button" id="btnNextFrame" title="Next frame (→)">Next ▶</button>
@@ -223,35 +223,12 @@
           <h2>Color mode</h2>
           <label class="ctrl">Mode
             <select id="colorMode">
-              <option value="coarse5" selected>Coarse 5-class</option>
-              <option value="fine">Fine 22-class</option>
-              <option value="coarse">Coarse 4-class</option>
-              <option value="lidar">Lidar id (points)</option>
+              <option value="fine" selected>Fine</option>
             </select>
           </label>
-          <div class="hint" style="margin-top:6px">
-            5-class: dynamic / static / noise / drivable / non_drivable<br/>
-            4-class: dynamic / static / freespace / noise<br/>
-            Lidar: 1 / 2 / 14 (points only; occ stays semantic)
-          </div>
-          <div id="coarse5Toggles" style="margin-top:8px">
-            <label class="ctrl"><input type="checkbox" id="togC5Dyn" checked /> <span style="color:#ff3326">dynamic</span></label>
-            <label class="ctrl"><input type="checkbox" id="togC5Sta" checked /> <span style="color:#ff9e00">static</span></label>
-            <label class="ctrl"><input type="checkbox" id="togC5Noise" checked /> <span style="color:#737373">noise</span></label>
-            <label class="ctrl"><input type="checkbox" id="togC5Drv" checked /> <span style="color:#33d94d">drivable</span></label>
-            <label class="ctrl"><input type="checkbox" id="togC5Ndrv" checked /> <span style="color:#4080ff">non_drivable</span></label>
-          </div>
-          <div id="coarseToggles" style="margin-top:8px; display:none">
-            <label class="ctrl"><input type="checkbox" id="togDyn" checked /> dynamic</label>
-            <label class="ctrl"><input type="checkbox" id="togSta" checked /> static</label>
-            <label class="ctrl"><input type="checkbox" id="togFree" checked /> freespace</label>
-            <label class="ctrl"><input type="checkbox" id="togNoise" checked /> noise</label>
-          </div>
-          <div id="lidarToggles" style="margin-top:8px; display:none">
-            <label class="ctrl"><input type="checkbox" id="togLid1" checked /> <span style="color:#28b4ff">lidar_1</span></label>
-            <label class="ctrl"><input type="checkbox" id="togLid2" checked /> <span style="color:#28dc28">lidar_2</span></label>
-            <label class="ctrl"><input type="checkbox" id="togLid14" checked /> <span style="color:#ff2828">lidar_14</span></label>
-          </div>
+          <div class="hint" id="colorModeHint" style="margin-top:6px"></div>
+          <div id="groupToggles"></div>
+          <div id="lidarToggles" style="margin-top:8px; display:none"></div>
         </div>
         <div class="row">
           <h2>Class legend</h2>
@@ -259,14 +236,14 @@
         </div>
         <div class="row">
           <h2>ROI (vehicle xyz)</h2>
-          <div class="hint">Default [-24,24]×[-25,150]×[-5,3]</div>
+          <div class="hint" id="roiDefaultHint">Default [-50,50]×[-50,50]×[-5,5]</div>
           <div style="display:grid; grid-template-columns:auto 1fr 1fr; gap:4px 6px; margin-top:8px; align-items:center">
             <span class="hint">x</span>
-            <input type="number" id="roiX0" step="1" value="-24" style="width:100%" />
-            <input type="number" id="roiX1" step="1" value="24" style="width:100%" />
+            <input type="number" id="roiX0" step="1" value="-50" style="width:100%" />
+            <input type="number" id="roiX1" step="1" value="50" style="width:100%" />
             <span class="hint">y</span>
-            <input type="number" id="roiY0" step="1" value="-25" style="width:100%" />
-            <input type="number" id="roiY1" step="1" value="150" style="width:100%" />
+            <input type="number" id="roiY0" step="1" value="-50" style="width:100%" />
+            <input type="number" id="roiY1" step="1" value="50" style="width:100%" />
             <span class="hint">z</span>
             <input type="number" id="roiZ0" step="0.5" value="-5" style="width:100%" />
             <input type="number" id="roiZ1" step="0.5" value="3" style="width:100%" />
@@ -374,13 +351,12 @@
             <label class="ctrl">Point filter
               <select id="projClassFilter">
                 <option value="all" selected>All classes</option>
-                <option value="10">Cone only (label 10)</option>
               </select>
             </label>
             <label class="ctrl" title="Vehicle-frame z range mapped across the full height color ramp">Height z
-              <input type="number" id="projHeightMin" min="-10" max="10" step="0.1" value="-2.2" style="width:58px" />
+              <input type="number" id="projHeightMin" min="-10" max="10" step="0.1" value="-3" style="width:58px" />
               <span>to</span>
-              <input type="number" id="projHeightMax" min="-10" max="10" step="0.1" value="0.5" style="width:58px" />
+              <input type="number" id="projHeightMax" min="-10" max="10" step="0.1" value="3" style="width:58px" />
             </label>
             <label class="ctrl">Point source
               <select id="projPointSource">
@@ -393,7 +369,7 @@
             </label>
             <button type="button" id="btnRefreshProj">Refresh projection</button>
           </div>
-          <div class="hint">High-contrast discrete height bands, default z=-2.2…0.5 m for cones/road objects; values above range saturate red</div>
+          <div class="hint">High-contrast discrete height bands across the configured z range; values above the range saturate red</div>
         </div>
         <div id="cams"></div>
       </section>

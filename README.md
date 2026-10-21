@@ -69,7 +69,7 @@ GSS 原数据库页面继续用于文档浏览；`web/gss.js` 只负责目录选
 - `<clip.url>/index.json`、index 中的 `meta_uri` 和 `assets.*.uri` 遵循 [SCHEMA.md](docs/SCHEMA.md)。
 
 场景 URL 保存在地址栏，可直接分享。`?source=external&scene=<scene URL>` 也可打开单个同源场景。
-外部模式从 scene index 读取 taxonomy/defaults，缺失字段使用 viewer 默认值，不维护第二份 profile。
+外部模式先 best-effort 拉 `/api/config` 作 base profile，再用 scene index 的 taxonomy/defaults 覆盖；两者都缺失时使用 viewer 通用默认值，不维护第二份 profile。
 外部模式不调用本地视频接口；普通 `serve.py` 模式保留原功能。
 
 ## 配置自定义
@@ -82,11 +82,12 @@ GSS 原数据库页面继续用于文档浏览；`web/gss.js` 只负责目录选
 format: robotruck          # 选用 config/formats/<name>.yaml
 host: 127.0.0.1
 port: 8765
+gallery_upstream: http://127.0.0.1:8738   # 可选：/gallery/* 反代到该上游；删掉即关闭
 python:                    # 导出 MP4 时依次找可用解释器
   - .venv/bin/python
 ```
 
-- 换格式：改 `format:` 为新文件名（不含 `.yaml`）。
+- 换格式：改 `format:` 为新文件名（不含 `.yaml`）；`config/formats/` 下只有一个 YAML 时可省略。
 - 改默认监听：改 `host` / `port`，或启动时仍用命令行覆盖。
 - 导出找不到 OpenCV：在 `python:` 列表里加上带 `numpy` + `opencv-python-headless` 的解释器路径。
 
@@ -99,9 +100,16 @@ python:                    # 导出 MP4 时依次找可用解释器
 | `roi.x/y/z` | 默认三维 ROI（车体坐标，米） | 「Reset default」与启动时的裁剪范围 |
 | `voxel` | 默认体素边长（米） | 与包内 `grid.voxel` 一致时显示最整齐 |
 | `taxonomy.fine.n` | fine 类别个数 | `label ≥ n` 一律当 noise |
-| `taxonomy.coarse.fine_ids` | fine id → dynamic / static / freespace | 粗类开关与图例分组 |
-| `taxonomy.coarse.colors_rgb` | 粗类 RGB | 三维、投影、图例 |
-| `taxonomy.lidar_ids.colors_rgb` | lidar id → 色 | 点云 lidar 着色（HTML 里 1/2/14 勾选框未动态生成，增删 id 需同步改 UI） |
+| `taxonomy.<group>` | 任意自定义颜色组：`order` + `colors_rgb` + `fine_ids`（或 `fine_to_coarse`）即成为一个粗类着色模式，组名（如 `coarse5`）出现在 Mode 下拉里 | 可有多组；勾选框按组自动生成 |
+| `taxonomy.<group>.raw_ids` | 组名 → 包内原始标签值（用于标签直接存组编码的包，如 0..4 存 coarse5） | 按最大 raw 值自动判定包是 fine 编码还是组编码 |
+| `taxonomy.lidar_ids.colors_rgb` | lidar id → 色 | 点云 lidar 着色与勾选框（按 id 自动生成） |
+| `ui.default_color_mode` | 启动着色模式（`fine` / 组名 / `lidar`） | 顶栏 Mode 默认项 |
+| `ui.occ_variants` | 包内无 `occupancy_variants` 时的备选 OCC 变体 | 「OCC Algorithm」下拉 |
+| `ui.point_filters` | 相机投影点过滤：`value`（`all` 或标签 id）+ `label` + 可选 `highlight_rgb` 单色高亮 | 「Point filter」下拉 |
+| `ui.height_range` | 投影高度色带的车体 z 范围 | 「Height z」默认值 |
+| `point_preview.*` | clip 聚合点云的步进采样预览：`dir` / `prefix` / `max_points` / `files[].record_bytes`；`enabled: false` 则前端直接读全量 | serve.py 预生成 `<dir>/<prefix>*`，前端改拉预览 |
+| `source.camera_fallback.*` | **仅服务端、不下发浏览器**：包里相机 JPEG 缺失时，按 `clips_root` + `index_file` 的 `timestamp_key→cameras_key→md5_key` 查 md5，再按 `path_template`（`{m0}/{m1}/{rest}/{md5}` 占位）在 `volumes` 里找原图 | 整节删除即关闭回退，缺失相机直接 404 |
+| `gss.default_dataset` | `source=gss` 且 URL 无 `?dataset=` 时的默认集合（按子串匹配） | GSS 目录下拉默认项 |
 | `mongo.*` / `disk.*` | Robotruck 落库约定 | **仅文档/后续 ingest 用**；当前 viewer 不连库、不按这些路径找文件 |
 | `scene.occupancy_keys` | 规范包里 occupancy 资产键 | 须与 [docs/SCHEMA.md](docs/SCHEMA.md) 及 `meta.assets.occupancy` 一致 |
 
@@ -110,10 +118,12 @@ python:                    # 导出 MP4 时依次找可用解释器
 ### 3. 增加另一种 occupancy（智驾 / 具身等）
 
 1. 把数据导出（或离线转换）成规范 scene 包：`index.json`、`frames[]`、`assets.*.uri`。
-2. 复制 `config/formats/robotruck.yaml` → `config/formats/<mydomain>.yaml`，改 `id`、`schema_version`、`taxonomy`、`roi`。
+2. 复制 `config/formats/robotruck.yaml` → `config/formats/<mydomain>.yaml`，改 `id`、`schema_version`、`taxonomy`、`roi`，并按需调整 `ui` / `point_preview` / `source.camera_fallback` / `gss` 各节（不需要的节整节删除即可，前端与服务端均有通用默认）。
 3. 在 `config/viewer.yaml` 设 `format: <mydomain>`，重启服务。
 
 Mongo 字段可以先留空或写成你们自己的库表名，不影响本地浏览。
+
+> **GSS 静态部署注意**：`?source=gss` 纯静态托管（无 `serve.py`）时 `/api/config` 不可达，自定义颜色组、`ui.*` 默认值与 `gss.default_dataset` 会退化为通用默认（fine 着色、首个数据集）。要保留格式偏好，让 GSS 反代 `/api/config` 到运行中的 `serve.py`，或在 scene `index.json` 内自带 `taxonomy` 等 profile 字段（external 模式同理：index 覆盖 `/api/config` 的 base）。
 
 ## 目录
 

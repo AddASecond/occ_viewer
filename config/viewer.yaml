@@ -1,6 +1,8 @@
 format: robotruck
 host: 127.0.0.1
 port: 8765
+# Optional: /gallery/* is reverse-proxied to this upstream; omit to disable.
+gallery_upstream: http://127.0.0.1:8738
 python:
   - .venv/bin/python
   - /home/dev/01develop/LitePT/.venv_smoke/bin/python

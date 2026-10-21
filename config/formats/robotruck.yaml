@@ -22,11 +22,52 @@ scene:
   index_file: index.json
   occupancy_keys: [ijk, labels, centers, counts]
   relative_prefixes: [frames/, static_agg/]
+
+# --- Source-data integration (serve.py only; never sent to the browser) ---
+# When a scene package references frames/<ts>/cameras/<name>.jpg that is
+# missing on disk, serve.py resolves the original delivery JPEG: per-clip
+# index file maps timestamp -> camera -> md5, and JPEGs are sharded by md5.
+source:
+  camera_fallback:
+    clips_root: /data/rawdata-4/annotation_delivery_938_1hz_v3_20260929/clips
+    index_file: frames.jsonl
+    timestamp_key: timestamp_ns
+    cameras_key: cameras
+    md5_key: md5
+    volumes:
+      - /data/rawdata-4
+      - /data/rawdata
+      - /data/rawdata-2
+      - /data/rawdata-3
+    # {m0}=md5[0:2] {m1}=md5[2:4] {rest}=md5[4:] {md5}=full md5
+    path_template: camera/{m0}/{m1}/{rest}.jpg
+
+# --- Clip point-cloud aggregate preview ---
+# serve.py pre-generates strided previews next to the aggregate binaries;
+# app.js (local mode) requests "<dir>/<prefix><basename>" instead of the
+# full file. Disable for formats that should stream the full aggregate.
+point_preview:
+  enabled: true
+  dir: point_agg
+  prefix: preview_
+  max_points: 800000
+  files:
+    - { name: xyz.f32.bin, record_bytes: 12 }
+    - { name: labels.u8.bin, record_bytes: 1 }
+    - { name: lidar_id.u8.bin, record_bytes: 1 }
+
 roi:
   x: [-24.0, 24.0]
   y: [-25.0, 150.0]
   z: [-5.0, 3.0]
 voxel: 0.2
+
+# taxonomy.fine        — semantic ids (n classes; colors/names come from the scene package)
+# taxonomy.<group>     — any extra key with order + colors_rgb + fine_ids (or
+#                        fine_to_coarse) becomes a coarse color mode named <group>.
+#                        raw_ids (optional) maps group names to raw label values
+#                        for packages exported with group labels instead of fine ids.
+# taxonomy.lidar_ids   — per-lidar point colors; ids also drive the lidar toggles.
 taxonomy:
   fine:
     n: 22
@@ -54,7 +95,7 @@ taxonomy:
       static: [7, 8, 9, 10, 13, 14, 15, 16]
       drivable: [17, 18]
       non_drivable: [19, 20, 21]
-    raw5_ids:
+    raw_ids:
       dynamic: [0]
       static: [1]
       noise: [2]
@@ -65,3 +106,22 @@ taxonomy:
       1: [40, 180, 255]
       2: [40, 220, 40]
       14: [255, 40, 40]
+
+# --- Browser UI defaults ---
+ui:
+  default_color_mode: coarse5
+  # Fallback variants when a scene index.json has no occupancy_variants.
+  occ_variants:
+    - { id: litept, name: LitePT dynamic }
+  # Camera point-projection class filter; value "all" or a label id (string).
+  # highlight_rgb: draw all filtered points in this single color.
+  point_filters:
+    - { value: all, label: All classes }
+    - { value: "10", label: Cone only (label 10), highlight_rgb: [255, 80, 0] }
+  # Vehicle-frame z range for the height color ramp.
+  height_range: [-2.2, 0.5]
+
+# --- GSS catalog (source=gss) ---
+gss:
+  # Preferred dataset when the URL has no ?dataset= param; substring match.
+  default_dataset: occ_data_clips_lidar14_0813

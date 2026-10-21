@@ -33,13 +33,54 @@ import yaml
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web"
 SRC = ROOT / "src"
-SRC_CLIPS = Path("/data/rawdata-4/annotation_delivery_938_1hz_v3_20260929/clips")
-CAMERA_VOLUMES = (
-    Path("/data/rawdata-4"),
-    Path("/data/rawdata"),
-    Path("/data/rawdata-2"),
-    Path("/data/rawdata-3"),
-)
+
+
+def _load_yaml(path: Path) -> dict:
+    return yaml.safe_load(path.read_text()) or {}
+
+
+CFG = _load_yaml(ROOT / "config" / "viewer.yaml")
+
+
+def _load_format(cfg: dict) -> dict:
+    """Active format profile: config/formats/<viewer.yaml format>.yaml.
+
+    With no `format:` key, fall back to the only available profile so a
+    single-format checkout needs zero configuration.
+    """
+    name = cfg.get("format")
+    formats_dir = ROOT / "config" / "formats"
+    if not name:
+        candidates = sorted(formats_dir.glob("*.yaml"))
+        if len(candidates) == 1:
+            name = candidates[0].stem
+        else:
+            raise SystemExit(
+                "config/viewer.yaml: set `format:` to one of "
+                + ", ".join(p.stem for p in candidates)
+            )
+    path = formats_dir / f"{name}.yaml"
+    if not path.is_file():
+        raise SystemExit(f"format profile not found: {path}")
+    return _load_yaml(path)
+
+
+FMT = _load_format(CFG)
+
+# --- Source-data integration (format-specific, optional; server-side only) ---
+_CAM_FB = (FMT.get("source") or {}).get("camera_fallback") or {}
+SRC_CLIPS = Path(_CAM_FB["clips_root"]) if _CAM_FB.get("clips_root") else None
+CAMERA_VOLUMES = tuple(Path(v) for v in _CAM_FB.get("volumes") or [])
+CAM_INDEX_FILE = _CAM_FB.get("index_file") or "frames.jsonl"
+CAM_TS_KEY = _CAM_FB.get("timestamp_key") or "timestamp_ns"
+CAM_CAMERAS_KEY = _CAM_FB.get("cameras_key") or "cameras"
+CAM_MD5_KEY = _CAM_FB.get("md5_key") or "md5"
+CAM_PATH_TEMPLATE = _CAM_FB.get("path_template") or "camera/{m0}/{m1}/{rest}.jpg"
+CAMERA_FALLBACK_ENABLED = bool(SRC_CLIPS and CAMERA_VOLUMES)
+
+# /gallery/* reverse proxy (viewer.yaml); disabled when unset.
+GALLERY_UPSTREAM = str(CFG.get("gallery_upstream") or "").rstrip("/")
+
 _FRAME_INDEX: dict[str, dict[str, dict]] = {}
 # Clip discovery is consulted by every static-file request; throttle the scan.
 _CLIP_SCAN_TTL = 2.0
@@ -50,35 +91,45 @@ _CLIP_SCAN = {"at": 0.0, "root": None, "found": {}}
 def find_camera_jpg(md5: str) -> Path | None:
     if not md5 or len(md5) < 5:
         return None
+    rel = CAM_PATH_TEMPLATE.format(m0=md5[:2], m1=md5[2:4], rest=md5[4:], md5=md5)
     for volume in CAMERA_VOLUMES:
-        path = volume / "camera" / md5[:2] / md5[2:4] / (md5[4:] + ".jpg")
+        path = volume / rel
         if path.is_file():
             return path
     return None
 
 
 def lookup_source_camera(clip_id: str, frame_ts: str, cam: str) -> Path | None:
+    if not CAMERA_FALLBACK_ENABLED:
+        return None
     frames = _FRAME_INDEX.get(clip_id)
     if frames is None:
         frames = {}
-        src = SRC_CLIPS / clip_id / "frames.jsonl"
+        src = SRC_CLIPS / clip_id / CAM_INDEX_FILE
         if src.is_file():
             for line in src.read_text().splitlines():
                 if not line.strip():
                     continue
                 row = json.loads(line)
-                frames[str(row.get("timestamp_ns"))] = row
+                frames[str(row.get(CAM_TS_KEY))] = row
         _FRAME_INDEX[clip_id] = frames
     row = frames.get(str(frame_ts))
     if not row:
         return None
-    info = (row.get("cameras") or {}).get(cam)
+    info = (row.get(CAM_CAMERAS_KEY) or {}).get(cam)
     if not info:
         return None
-    return find_camera_jpg(info.get("md5") or "")
+    return find_camera_jpg(info.get(CAM_MD5_KEY) or "")
 
 
-PREVIEW_MAX_POINTS = 800_000
+_PV = FMT.get("point_preview") or {}
+PREVIEW_ENABLED = bool(_PV.get("enabled", True)) and bool(_PV.get("files"))
+PREVIEW_DIR = _PV.get("dir") or "point_agg"
+PREVIEW_PREFIX = _PV.get("prefix") or "preview_"
+PREVIEW_MAX_POINTS = int(_PV.get("max_points") or 800_000)
+PREVIEW_FILES = tuple(
+    (f["name"], int(f["record_bytes"])) for f in (_PV.get("files") or [])
+)
 
 
 def _write_strided_preview(src: Path, dst: Path, count: int, itemsize: int, step: int) -> bool:
@@ -103,13 +154,14 @@ def _write_strided_preview(src: Path, dst: Path, count: int, itemsize: int, step
 
 
 def ensure_point_preview(scene: Path) -> None:
-    agg = scene / "point_agg"
-    mapping = (("xyz.f32.bin", 12), ("labels.u8.bin", 1), ("lidar_id.u8.bin", 1))
+    if not PREVIEW_ENABLED:
+        return
+    agg = scene / PREVIEW_DIR
     # Cheap stats first; only parse index.json when a preview must be rebuilt.
     pending = []
-    for name, itemsize in mapping:
+    for name, itemsize in PREVIEW_FILES:
         src = agg / name
-        dst = agg / f"preview_{name}"
+        dst = agg / f"{PREVIEW_PREFIX}{name}"
         if not src.is_file():
             continue
         sstat = src.stat()
@@ -146,10 +198,6 @@ def ensure_point_preview(scene: Path) -> None:
 
 
 EXPORT_SCRIPT = SRC / "scene_video.py"
-CFG = yaml.safe_load((ROOT / "config" / "viewer.yaml").read_text()) or {}
-FMT = yaml.safe_load(
-    (ROOT / "config" / "formats" / f"{CFG.get('format', 'robotruck')}.yaml").read_text()
-) or {}
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 try:
@@ -445,7 +493,7 @@ class Handler(SimpleHTTPRequestHandler):
         rest = path[len("/gallery"):] or "/"
         if not rest.startswith("/"):
             rest = "/" + rest
-        url = f"http://127.0.0.1:8738{rest}"
+        url = f"{GALLERY_UPSTREAM}{rest}"
         if query:
             url += "?" + query
         req = urllib.request.Request(url, method="GET")
@@ -478,12 +526,14 @@ class Handler(SimpleHTTPRequestHandler):
         path = unquote(parsed.path)
         qs = parse_qs(parsed.query)
 
-        if path == "/gallery" or path.startswith("/gallery/"):
+        if GALLERY_UPSTREAM and (path == "/gallery" or path.startswith("/gallery/")):
             self._proxy_review(path, parsed.query)
             return
 
         if path == "/api/config":
-            self._send_json(FMT)
+            # `source` is server-side only (raw-data integration); the rest of
+            # the format profile drives the browser (taxonomy, ROI, UI, gss).
+            self._send_json({k: v for k, v in FMT.items() if k != "source"})
             return
 
         if path == "/api/clips":
@@ -582,13 +632,14 @@ class Handler(SimpleHTTPRequestHandler):
             target = (scene / rel).resolve() if rel else scene
             if rel and not str(target).startswith(str(scene)):
                 return str(WEB / "index.html")
-            if rel.startswith("point_agg/preview_"):
+            if PREVIEW_ENABLED and rel.startswith(f"{PREVIEW_DIR}/{PREVIEW_PREFIX}"):
                 ensure_point_preview(scene)
                 target = (scene / rel).resolve()
             if rel and not target.is_file():
                 parts_rel = rel.split("/")
                 if (
-                    len(parts_rel) == 4
+                    CAMERA_FALLBACK_ENABLED
+                    and len(parts_rel) == 4
                     and parts_rel[0] == "frames"
                     and parts_rel[2] == "cameras"
                     and parts_rel[3].endswith(".jpg")

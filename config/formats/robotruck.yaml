@@ -68,21 +68,16 @@ voxel: 0.2
 #                        raw_ids (optional) maps group names to raw label values
 #                        for packages exported with group labels instead of fine ids.
 # taxonomy.lidar_ids   — per-lidar point colors; ids also drive the lidar toggles.
+# taxonomy_exclude    — group ids dropped when merging scene packages; robotruck
+#                       scene index.json still carries the legacy 4-class `coarse`,
+#                       and the viewer must not show it anywhere.
+taxonomy_exclude: [coarse]
+
 taxonomy:
   fine:
     n: 22
-  coarse:
-    order: [dynamic, static, freespace, noise]
-    colors_rgb:
-      dynamic: [230, 64, 64]
-      static: [64, 160, 255]
-      freespace: [72, 200, 96]
-      noise: [160, 160, 160]
-    fine_ids:
-      dynamic: [0, 1, 2, 3, 4, 5, 6, 11, 12]
-      static: [7, 8, 9, 10, 13, 14, 15, 16]
-      freespace: [17, 18, 19, 20, 21]
   coarse5:
+    label: Coarse 5-class
     order: [dynamic, static, noise, drivable, non_drivable]
     colors_rgb:
       dynamic: [255, 51, 38]

@@ -100,8 +100,9 @@ python:                    # 导出 MP4 时依次找可用解释器
 | `roi.x/y/z` | 默认三维 ROI（车体坐标，米） | 「Reset default」与启动时的裁剪范围 |
 | `voxel` | 默认体素边长（米） | 与包内 `grid.voxel` 一致时显示最整齐 |
 | `taxonomy.fine.n` | fine 类别个数 | `label ≥ n` 一律当 noise |
-| `taxonomy.<group>` | 任意自定义颜色组：`order` + `colors_rgb` + `fine_ids`（或 `fine_to_coarse`）即成为一个粗类着色模式，组名（如 `coarse5`）出现在 Mode 下拉里 | 可有多组；勾选框按组自动生成 |
+| `taxonomy.<group>` | 任意自定义颜色组：`order` + `colors_rgb` + `fine_ids`（或 `fine_to_coarse`）即成为一个粗类着色模式，组名（如 `coarse5`）出现在 Mode 下拉里；可选 `label` 覆盖下拉显示名 | 可有多组；勾选框按组自动生成 |
 | `taxonomy.<group>.raw_ids` | 组名 → 包内原始标签值（用于标签直接存组编码的包，如 0..4 存 coarse5） | 按最大 raw 值自动判定包是 fine 编码还是组编码 |
+| `taxonomy_exclude` | 合并 scene 包 index.json 时要丢弃的组 id（如 robotruck 老包里的 4 类 `coarse`） | 该组不出现在 Mode / 图例 / 勾选框，即使 scene 包仍携带 |
 | `taxonomy.lidar_ids.colors_rgb` | lidar id → 色 | 点云 lidar 着色与勾选框（按 id 自动生成） |
 | `ui.default_color_mode` | 启动着色模式（`fine` / 组名 / `lidar`） | 顶栏 Mode 默认项 |
 | `ui.occ_variants` | 包内无 `occupancy_variants` 时的备选 OCC 变体 | 「OCC Algorithm」下拉 |
@@ -123,14 +124,14 @@ python:                    # 导出 MP4 时依次找可用解释器
 
 Mongo 字段可以先留空或写成你们自己的库表名，不影响本地浏览。
 
-> **GSS 静态部署注意**：`?source=gss` 纯静态托管（无 `serve.py`）时 `/api/config` 不可达，自定义颜色组、`ui.*` 默认值与 `gss.default_dataset` 会退化为通用默认（fine 着色、首个数据集）。要保留格式偏好，让 GSS 反代 `/api/config` 到运行中的 `serve.py`，或在 scene `index.json` 内自带 `taxonomy` 等 profile 字段（external 模式同理：index 覆盖 `/api/config` 的 base）。
+> **静态部署**：`?source=gss` 等纯静态托管（无 `serve.py`）时 `/api/config` 不可达，浏览器会退回到 `web/format.json`——它是 `serve.py` 启动时按当前 `format` 自动生成的构建产物（与 `/api/config` 内容一致，不含 `source` 节）。改完格式配置后运行一次 `serve.py`（或 `python3 -c "import serve"`）即可刷新，再提交 `web/format.json` 给静态环境使用。
 
 ## 目录
 
 | 路径 | 作用 |
 |------|------|
 | `serve.py` | HTTP、`/api/clips`、`/api/config`、视频任务 |
-| `web/` | Three.js 页面 |
+| `web/` | Three.js 页面（`format.json` 为格式配置的浏览器侧构建产物） |
 | `src/scene_video.py` | MP4 导出 |
 | `config/` | 服务 + 格式 YAML |
 | `docs/` | 手册、SCHEMA、Robotruck Mongo 说明 |

@@ -197,6 +197,9 @@ let lidarIdsList = [];
  *  group labels instead of fine ids. */
 let labelGroups = [];
 let groupById = new Map();
+// Group ids the active format never shows, even if a scene index still
+// carries them (e.g. a legacy coarse grouping superseded by a newer one).
+const taxonomyExclude = new Set();
 /** Fine ids of the first group's "dynamic" member (clip-aggregate split). */
 let dynFineIds = new Set();
 /** "fine": labels are fine ids. "raw": labels are a group's raw_ids values. */
@@ -234,6 +237,7 @@ function buildLabelGroup(id, g = {}) {
   }
   return {
     id,
+    label: g.label || `${id[0].toUpperCase()}${id.slice(1)} ${order.length}-class`,
     order,
     colors,
     fineSets,
@@ -246,14 +250,24 @@ function buildLabelGroup(id, g = {}) {
 function applyProfile(p = {}) {
   // Format YAML and canonical scene indexes share the same profile shape;
   // each call merges one source over the current state (scene index wins).
+  const excludeBefore = taxonomyExclude.size;
+  if (Array.isArray(p.taxonomy_exclude)) {
+    for (const id of p.taxonomy_exclude) taxonomyExclude.add(String(id));
+  }
   const t = p.taxonomy || {};
   if (t.fine && t.fine.n) nFine = t.fine.n;
   for (const [id, g] of Object.entries(t)) {
     if (id === "fine" || id === "lidar_ids" || !g || typeof g !== "object") continue;
+    if (taxonomyExclude.has(id)) continue;
     const group = buildLabelGroup(id, g);
     const i = labelGroups.findIndex((x) => x.id === id);
     if (i >= 0) labelGroups[i] = group;
     else labelGroups.push(group);
+  }
+  // Pruning is only needed when the exclude set grew: groups skipped by the
+  // guard above never enter the list, and an unchanged set already pruned.
+  if (taxonomyExclude.size > excludeBefore) {
+    labelGroups = labelGroups.filter((g) => !taxonomyExclude.has(g.id));
   }
   groupById = new Map(labelGroups.map((g) => [g.id, g]));
   const L = t.lidar_ids;
@@ -297,8 +311,7 @@ function buildFormatUi() {
     sel.innerHTML = "";
     sel.appendChild(new Option(nFine ? `Fine ${nFine}-class` : "Fine", "fine"));
     for (const g of labelGroups) {
-      const name = g.id[0].toUpperCase() + g.id.slice(1);
-      sel.appendChild(new Option(`${name} ${g.order.length}-class`, g.id));
+      sel.appendChild(new Option(g.label, g.id));
     }
     if (lidarIdsList.length) sel.appendChild(new Option("Lidar id (points)", "lidar"));
     const configured = uiConfig.default_color_mode;
@@ -2166,7 +2179,12 @@ async function boot() {
   // an external scene index may still override it later in loadClip.
   let formatConfig = null;
   try { formatConfig = await fetchJson(occUrl("/api/config")); }
-  catch (e) { if (!externalSource) setStatus(`config fallback: ${e}`); }
+  catch (e) {
+    // Static deployments (e.g. GSS) have no server API; web/format.json is the
+    // build artifact with the same profile as the active format YAML.
+    try { formatConfig = await fetchJson("format.json"); }
+    catch (_) { if (!externalSource) setStatus(`config fallback: ${e}`); }
+  }
   if (formatConfig) applyProfile(formatConfig);
   if (mongoSource) {
     const { connectGss } = await import("./gss.js");

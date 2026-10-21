@@ -67,6 +67,25 @@ def _load_format(cfg: dict) -> dict:
 
 FMT = _load_format(CFG)
 
+
+def _export_web_profile() -> None:
+    """Mirror the browser-facing profile into web/format.json.
+
+    Static deployments (e.g. GSS) have no /api/config, so the viewer falls
+    back to this build artifact to keep taxonomy/UI defaults identical.
+    """
+    payload = {k: v for k, v in FMT.items() if k != "source"}
+    text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    dest = WEB / "format.json"
+    try:
+        if not dest.exists() or dest.read_text() != text:
+            dest.write_text(text)
+    except OSError as exc:
+        print(f"warning: cannot write {dest}: {exc}", file=sys.stderr)
+
+
+_export_web_profile()
+
 # --- Source-data integration (format-specific, optional; server-side only) ---
 _CAM_FB = (FMT.get("source") or {}).get("camera_fallback") or {}
 SRC_CLIPS = Path(_CAM_FB["clips_root"]) if _CAM_FB.get("clips_root") else None

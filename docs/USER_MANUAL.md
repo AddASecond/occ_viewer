@@ -251,7 +251,7 @@ flowchart LR
 | 模式 | 作用对象 | 说明 |
 |------|----------|------|
 | **Fine 22-class** | Occ + 点云 + 投影 | Waymo 细类语义色 |
-| **Coarse 4-class** | 同上 | dynamic / static / freespace / noise；可单独勾选显示 |
+| **Coarse 5-class** | 同上 | dynamic / static / noise / drivable / non_drivable；可单独勾选显示 |
 | **Lidar id (points)** | **仅点云与点投影** | lidar_1 / 2 / 14 着色；Occ 仍按语义色 |
 
 粗类与雷达开关只在对应 Mode 下显示。

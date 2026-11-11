@@ -182,3 +182,22 @@ python serve.py --scene <scene_root> --host 0.0.0.0 --port 8765
 
 Robotruck Mongo / disk / taxonomy: `config/formats/robotruck.yaml`.  
 Active format: `config/viewer.yaml` (`format:`).
+
+### Camera image variants
+
+`assets.cameras` can contain both `cameraN_raw` and `cameraN_undistort`.
+Each entry keeps its own `image`, `K`, `width`, `height`, and camera-time
+`T_c_v_lidar_ref`; `camera_id` groups the entries and `image_variant` is `raw`
+or `undistort`. Virtual cameras without a raw counterpart remain explicitly
+labelled as rectified-only when the user selects raw images.
+
+`distortion` contains the complete OpenCV pinhole coefficients: 0, 4, 5, or 8
+values. Eight values are `[k1,k2,p1,p2,k3,k4,k5,k6]`, including the rational
+radial denominator. `dist5` remains a fallback for legacy five-coefficient
+scenes; it must not be used to truncate a rational lens. The image selector
+switches the complete calibration with the image. Point and voxel projection
+use the same camera model.
+
+`Current frame (deskew)` projects `assets.frame_sensor_points`. Loading the
+clip aggregate for the 3D view does not change that source. `Clip aggregate`
+loads and transforms the map cloud independently for camera projection.

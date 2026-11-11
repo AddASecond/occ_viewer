@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { createCameraProjector, selectCameraImages } from "./camera.js";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 
 if (location.pathname === "/occ") {
@@ -122,7 +123,7 @@ const el = {
   projHeightMin: document.getElementById("projHeightMin"),
   projHeightMax: document.getElementById("projHeightMax"),
   projPointSource: document.getElementById("projPointSource"),
-  projDistortion: document.getElementById("projDistortion"),
+  cameraImageVariant: document.getElementById("cameraImageVariant"),
   btnRefreshProj: document.getElementById("btnRefreshProj"),
   btnFit: document.getElementById("btnFit"),
   classLegend: document.getElementById("classLegend"),
@@ -599,6 +600,7 @@ function beginLoad(message) {
   currentMeta = null;
   ptXYZ = ptLabels = ptLidar = null;
   framePtXYZ = framePtLabels = framePtLidar = null;
+  aggregateProjection = null;
   exportedOcc = null;
   occIjk = occLabels = occProjIjk = occProjLabels = occCenters = null;
   el.cams.replaceChildren();
@@ -1354,12 +1356,6 @@ function fitCamera(meta) {
   controls.update();
 }
 
-const ZERO_DIST5 = [0, 0, 0, 0, 0];
-
-function projectionUsesDistortion() {
-  return Boolean(el.projDistortion && el.projDistortion.checked);
-}
-
 /**
  * Project each occupied voxel cube onto the image:
  * 8 lattice corners → distorted UV → convex hull silhouette.
@@ -1391,42 +1387,10 @@ function projectOccCubes(cam, maxCells = 60000) {
 
   // Hoisted projection state; per-corner math writes into one scratch point
   // instead of allocating a {u,v,z} object for each of the 8 corners.
-  const useDist = projectionUsesDistortion();
-  const T = cam.T_c_v_lidar_ref || cam.T_c_v;
-  const K = cam.K;
-  const fx = K[0], fy = K[4], cx = K[2], cy = K[5];
-  const dist = useDist ? (cam.dist5 || ZERO_DIST5) : ZERO_DIST5;
-  const k1 = dist[0] || 0, k2 = dist[1] || 0, p1 = dist[2] || 0, p2 = dist[3] || 0, k3 = dist[4] || 0;
-  const fxBound = K[0] || 1000;
+  const fxBound = cam.K[0] || 1000;
   const scratch = { u: 0, v: 0, z: 0 };
-  const projectTo = (x, y, z) => {
-    const xc = T[0] * x + T[1] * y + T[2] * z + T[3];
-    const yc = T[4] * x + T[5] * y + T[6] * z + T[7];
-    const zc = T[8] * x + T[9] * y + T[10] * z + T[11];
-    if (zc <= 0.3) return false;
-    let xn = xc / zc;
-    let yn = yc / zc;
-    if (useDist) {
-      const r2 = xn * xn + yn * yn;
-      // Guard extreme radtan (e.g. k3≈-3.8 on some rigs) outside reliable FOV.
-      if (r2 > 1.2) return false;
-      const r4 = r2 * r2;
-      const radial = 1 + k1 * r2 + k2 * r4 + k3 * (r4 * r2);
-      if (!Number.isFinite(radial) || Math.abs(radial) > 20) return false;
-      const xpp = xn * radial + 2 * p1 * xn * yn + p2 * (r2 + 2 * xn * xn);
-      const ypp = yn * radial + p1 * (r2 + 2 * yn * yn) + 2 * p2 * xn * yn;
-      if (!Number.isFinite(xpp) || !Number.isFinite(ypp)) return false;
-      xn = xpp;
-      yn = ypp;
-    }
-    const u = fx * xn + cx;
-    const vv = fy * yn + cy;
-    if (!Number.isFinite(u) || !Number.isFinite(vv)) return false;
-    scratch.u = u;
-    scratch.v = vv;
-    scratch.z = zc;
-    return true;
-  };
+  const project = createCameraProjector(cam);
+  const projectTo = (x, y, z) => project(x, y, z, scratch);
   const cornerUV = new Float64Array(16);
 
   const quads = [];
@@ -1524,14 +1488,10 @@ function fillStyleForOccLab(lab) {
 }
 
 function projectVehToImage(xyz, labels, cam, maxN = 120000, lidarIds = null) {
-  const K = cam.K;
-  const T = cam.T_c_v_lidar_ref || cam.T_c_v;
-  const dist = projectionUsesDistortion()
-    ? (cam.dist5 || [0, 0, 0, 0, 0])
-    : [0, 0, 0, 0, 0];
+  const project = createCameraProjector(cam);
+  const pixel = {};
   const { w, h } = camSize(cam);
-  const fx = K[0], fy = K[4], cx = K[2], cy = K[5];
-  const k1 = dist[0] || 0, k2 = dist[1] || 0, p1 = dist[2] || 0, p2 = dist[3] || 0, k3 = dist[4] || 0;
+  const fx = cam.K[0], fy = cam.K[4];
   const nAll = labels.length;
   const step = nAll > maxN ? Math.ceil(nAll / maxN) : 1;
   const classFilter = el.projClassFilter ? el.projClassFilter.value : "all";
@@ -1546,20 +1506,8 @@ function projectVehToImage(xyz, labels, cam, maxN = 120000, lidarIds = null) {
     if (classFilterN !== null && labels[i] !== classFilterN) continue;
     const o = i * 3;
     const x = xyz[o], y = xyz[o + 1], z = xyz[o + 2];
-    const xc = T[0] * x + T[1] * y + T[2] * z + T[3];
-    const yc = T[4] * x + T[5] * y + T[6] * z + T[7];
-    const zc = T[8] * x + T[9] * y + T[10] * z + T[11];
-    if (zc <= 0.3) continue;
-    let xn = xc / zc;
-    let yn = yc / zc;
-    const r2 = xn * xn + yn * yn;
-    const r4 = r2 * r2;
-    const r6 = r4 * r2;
-    const radial = 1 + k1 * r2 + k2 * r4 + k3 * r6;
-    const xpp = xn * radial + 2 * p1 * xn * yn + p2 * (r2 + 2 * xn * xn);
-    const ypp = yn * radial + p1 * (r2 + 2 * yn * yn) + 2 * p2 * xn * yn;
-    const u = fx * xpp + cx;
-    const v = fy * ypp + cy;
+    if (!project(x, y, z, pixel)) continue;
+    const { u, v, z: zc } = pixel;
     if (u < -40 || v < -40 || u >= w + 40 || v >= h + 40) continue;
     out.push({
       u,
@@ -1667,11 +1615,9 @@ function drawProjectionOnCanvas(canvas, img, cam, mode, ptMinPx = 1) {
 
   if (mode === "points" || mode === "both") {
     const wantFrame = !el.projPointSource || el.projPointSource.value === "frame";
-    const useFrame = wantFrame && framePtXYZ && framePtLabels;
-    const useFilt = !useFrame && pointsObj && pointsObj.userData && pointsObj.userData.projXYZ;
-    const xyz = useFrame ? framePtXYZ : (useFilt ? pointsObj.userData.projXYZ : ptXYZ);
-    const labs = useFrame ? framePtLabels : (useFilt ? pointsObj.userData.projLab : ptLabels);
-    const lids = useFrame ? framePtLidar : (useFilt ? pointsObj.userData.projLid : ptLidar);
+    const xyz = wantFrame ? framePtXYZ : aggregateProjection?.xyz;
+    const labs = wantFrame ? framePtLabels : aggregateProjection?.labels;
+    const lids = wantFrame ? framePtLidar : aggregateProjection?.lidar;
     if (xyz && labs && labs.length) {
       const pts = projectVehToImage(xyz, labs, cam, maxN, lids);
       const sourcePx = Math.max(1, ptMinPx | 0);
@@ -1821,9 +1767,14 @@ window.addEventListener("keydown", (e) => {
   if (e.key === "Escape") closeLightbox();
 });
 
+let cameraController;
+let aggregateProjection = null;
 async function renderCams(meta, signal) {
+  cameraController?.abort();
+  cameraController = new AbortController();
+  signal = AbortSignal.any([signal, cameraController.signal]);
   el.cams.innerHTML = "";
-  const cameras = meta.assets?.cameras || meta.cameras || [];
+  const cameras = selectCameraImages(meta.assets?.cameras || meta.cameras || [], el.cameraImageVariant?.value || "undistort");
   let done = 0, failed = 0;
   const report = () => loadState("相机图片", cameras.length
     ? `成功 ${done}/${cameras.length}${failed ? ` · 失败 ${failed}` : ""}` : "无数据", signal);
@@ -1836,7 +1787,7 @@ async function renderCams(meta, signal) {
     name.className = "name";
     const sz = camSize(cam);
     const cameraName = document.createElement("span");
-    cameraName.textContent = cam.name;
+    cameraName.textContent = cam.name + (cam.variantUnavailable ? (cam.image_variant === "undistort" ? "（仅去畸变图）" : "（仅原图）") : "");
     const cameraSize = document.createElement("span");
     cameraSize.textContent = "加载中…";
     name.append(cameraName, cameraSize);
@@ -1919,7 +1870,7 @@ async function loadFrame(frameEntry, signal) {
   fitCamera(meta);
   const camerasReady = renderCams(meta, signal)
     .catch(error => loadState("相机图片", `失败：${error.message}`, signal));
-  const aggregateReady = useClipAggregate()
+  const aggregateReady = (useClipAggregate() || el.projPointSource.value === "aggregate")
     ? loadStaticAggFromIndex(signal).catch(error => loadState("聚合点云", `失败：${error.message}`, signal))
     : Promise.resolve(loadState("聚合点云", "按需加载：选择 Clip aggregate", signal));
   const pointsReady = fetchGroup("帧点云bin", ["xyz", "labels", "lidar_id"].map(key => pointsAsset(meta, key)), signal, 2);
@@ -1971,9 +1922,6 @@ async function loadFrame(frameEntry, signal) {
       ptXYZ = rawXYZ;
       ptLabels = rawLab;
       ptLidar = rawLid;
-      framePtXYZ = rawXYZ;
-      framePtLabels = rawLab;
-      framePtLidar = rawLid;
       ptsNote = rawLab.length.toLocaleString();
     } catch (e) {
       ptsNote = "加载失败";
@@ -2030,7 +1978,6 @@ async function loadFrame(frameEntry, signal) {
     setStatus("当前帧点云可查看；其他资产仍在加载…");
   }
   const sensorBuffers = await sensorReady;
-  await aggregateReady;
   signal.throwIfAborted();
   if (sensorBuffers) {
     framePtXYZ = new Float32Array(sensorBuffers[0]);
@@ -2038,11 +1985,17 @@ async function loadFrame(frameEntry, signal) {
     framePtLidar = sensorBuffers[2] ? new Uint8Array(sensorBuffers[2]) : null;
   }
 
+  refreshCamProjections();
+  await aggregateReady;
+  signal.throwIfAborted();
+  if (staticAgg && egoPoseRecord(meta.ego_pose)) {
+    aggregateProjection = staticAggInVehicle(egoPoseRecord(meta.ego_pose), null, null, null);
+  }
   if (useClipAggregate() && staticAgg && egoPoseRecord(meta.ego_pose)) {
     const xr = meta.x_range;
     const yr = meta.y_range;
     const zr = meta.z_range;
-    const st = staticAggInVehicle(
+    const st = staticAgg.full ? aggregateProjection : staticAggInVehicle(
       egoPoseRecord(meta.ego_pose),
       staticAgg.full ? null : [xr[0] * 1.5, xr[1] * 1.5],
       staticAgg.full ? null : yr,
@@ -2057,9 +2010,6 @@ async function loadFrame(frameEntry, signal) {
       ptLidar = merged.lidar;
     }
     if (merged && merged.labels) {
-      framePtXYZ = merged.xyz;
-      framePtLabels = merged.labels;
-      framePtLidar = merged.lidar;
       ptsNote = useClipAggregate()
         ? `${merged.labels.length.toLocaleString()} (clip aggregate → current vehicle)`
         : `${merged.labels.length.toLocaleString()} (vehicle ROI)`;
@@ -2069,6 +2019,7 @@ async function loadFrame(frameEntry, signal) {
 
   await Promise.all([occupancyReady, camerasReady]);
   signal.throwIfAborted();
+  refreshCamProjections();
   const odBoxCount = buildOdBoxes(meta);
 
   el.sceneInfo.innerHTML = `
@@ -2346,8 +2297,22 @@ if (el.projColorMode) el.projColorMode.addEventListener("change", refreshCamProj
 if (el.projClassFilter) el.projClassFilter.addEventListener("change", refreshCamProjections);
 if (el.projHeightMin) el.projHeightMin.addEventListener("input", refreshCamProjections);
 if (el.projHeightMax) el.projHeightMax.addEventListener("input", refreshCamProjections);
-if (el.projPointSource) el.projPointSource.addEventListener("change", refreshCamProjections);
-if (el.projDistortion) el.projDistortion.addEventListener("change", refreshCamProjections);
+el.projPointSource.addEventListener("change", async () => {
+  const signal = loadController.signal;
+  try {
+    if (el.projPointSource.value === "aggregate" && currentMeta && !aggregateProjection) {
+      await loadStaticAggFromIndex(signal);
+      signal.throwIfAborted();
+      aggregateProjection = staticAggInVehicle(egoPoseRecord(currentMeta.ego_pose), null, null, null);
+    }
+    refreshCamProjections();
+  } catch (error) { loadFailure(error, signal); }
+});
+el.cameraImageVariant?.addEventListener("change", () => {
+  if (!currentMeta) return;
+  closeLightbox();
+  renderCams(currentMeta, loadController.signal).catch(error => loadFailure(error));
+});
 el.btnRefreshProj.addEventListener("click", () => {
   refreshCamProjections();
   if (el.lightbox.classList.contains("open") && lb.cam && lb.img) {

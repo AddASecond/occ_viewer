@@ -364,8 +364,11 @@
                 <option value="aggregate">Clip aggregate</option>
               </select>
             </label>
-            <label class="ctrl" title="Apply the camera radtan coefficients stored with this raw JPEG">
-              <input type="checkbox" id="projDistortion" checked /> Apply calibrated distortion
+            <label class="ctrl">Image
+              <select id="cameraImageVariant">
+                <option value="undistort" selected>去畸变图</option>
+                <option value="raw">原图</option>
+              </select>
             </label>
             <button type="button" id="btnRefreshProj">Refresh projection</button>
           </div>
@@ -396,6 +399,6 @@
     }
   }
   </script>
-  <script type="module" src="./app.js?v=occ-load-43"></script>
+  <script type="module" src="./app.js?v=camera-variants-v1"></script>
 </body>
 </html>

@@ -179,6 +179,23 @@ Mongo / GSS 落库（**推荐，与 raw 对齐**）见 [GSS_OCC_STORAGE.md](./GS
 
 `points` 可为 `null`（未导出点云时）。
 
+### 共享静态点云扩展（2026-11-12）
+
+`assets.points.layout = "clip_static_plus_frame_dynamic/v1"` 时，三个数组仅存当前帧
+动态点，`n` 为实际存储点数；**不能直接将它当成完整聚合点云**。
+读取 `index.static_agg` 的全量地图坐标点云，按 `T_vehicle_map`（row-major float64
+4×4）变换后转 float32，按 `static_roi.{x,y,z}` 的闭区间过滤，再依原顺序拼接
+当前帧动态点。`static_n + n = logical_n`。标签及 lidar ID 顺序不变，不做采样。
+`static_ref` 固定为 `index.json#static_agg`，`ordering` 固定为 `static_then_dynamic`。
+`point_downsampling` 为 false，`static_roi_inclusive` 为 true。
+
+`stats.n_points_exported` 是该帧物理存储的动态点数，`stats.n_vis_points` 是重建后的
+逻辑点数。原始 `frame_sensor_points` 不变。OCC 仍由完整聚合点云以 0.25 m 生成。
+JavaScript 和 BLAS 的浮点乘加在极少数坐标上可能有最后一位差异；验收要求标签、
+雷达 ID、点数、顺序严格一致，坐标差小于 1 微米。
+
+`web/shared-points.mjs` 是新格式的参考读取实现。旧格式没有该 layout 字段时保持原逻辑。
+
 ---
 
 ## 4. 前端解析规则
@@ -186,7 +203,7 @@ Mongo / GSS 落库（**推荐，与 raw 对齐**）见 [GSS_OCC_STORAGE.md](./GS
 1. `GET {sceneBase}/index.json`
 2. 选帧 → `GET {sceneBase}/{meta_uri}`
 3. 任意资产：`url = absolute(uri) ? uri : sceneBase + "/" + uri`
-4. Occupancy 显示：用 `assets.occupancy.ijk` + `grid`；点云用 `assets.points.*`
+4. Occupancy 显示：用 `assets.occupancy.ijk` + `grid`。单帧点云读 `assets.frame_sensor_points.*`；选择聚合后才读 `assets.points.*`（共享静态格式再按描述合成）。缺少单帧资产时明确报错，不用聚合点云替代。v5 相机投影默认跟随左侧 3D，也可显式独立选择；OCC 不随点云数据源切换。见 `docs/point-sources-v5.md`。
 5. 兼容旧包：若无 `assets`，回退 `occupancy.ijk` 等相对 **frame 目录** 的旧字段
 
 本地预览：

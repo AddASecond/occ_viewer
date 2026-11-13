@@ -90,6 +90,12 @@ def main():
                 print(f'browser rendering real full-point frame: {time.monotonic()-started:.1f}s', flush=True)
         result = page.evaluate('window.__occTest()')
         assert result['finished'] and result['n'] == first['assets']['frame_sensor_points']['n'], result
+        if first['assets']['occupancy'].get('label_encoding') == 'rt7-v1':
+            assert page.locator('#colorMode').input_value() == 'rt7'
+            assert page.locator('#classLegend .legend-item').count() == 7
+            assert page.locator('#classLegend').inner_text().splitlines() == first['assets']['occupancy']['taxonomy']['names']
+            semantic = page.evaluate('window.__renderTest.semanticSummary()')
+            assert len(semantic['occ']) == 7 and sum(semantic['occ'].values()) == first['assets']['occupancy']['n']
         aggregate_uris = [value['uri'] for group in [first['assets']['points'], index['static_agg']]
                           for value in group.values() if isinstance(value, dict) and 'uri' in value]
         assert not any(path.endswith('/' + uri) for path in requested for uri in aggregate_uris), requested

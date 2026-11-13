@@ -59,7 +59,7 @@ def main():
     index['frames'] = [{'timestamp': args.timestamp, 'meta_uri': '/frame.json', 'n_occ': frame['stats']['n_occ']}]
     meta = rewrite({k: frame[k] for k in ('grid', 'assets', 'stats', 'ego_pose', 'od_boxes', 'taxonomy') if k in frame})
     meta['timestamp'] = args.timestamp
-    entry_name = 'index.color-nine-v6.html'
+    entry_name = 'index.occ-rt7-v8.html'
     dataset_url = '/db/perception_experiment/main_occ_clips/occ/scenes'
     point_key = frame['assets']['points']['xyz']['key']
     requests, lock = [], Lock()
@@ -142,7 +142,7 @@ def main():
                     assert data == (ROOT / 'web/index.html').read_bytes(), 'Published entry does not match tested source'
                 elif (ROOT / 'web' / path).is_file():
                     data = (ROOT / 'web' / path).read_bytes()
-                    if args.published_web and path in ('semantic-nine.v6.mjs', 'shared-points.mjs', 'asset-loader.v3.mjs'):
+                    if args.published_web and path in ('semantic-nine.v6.mjs', 'shared-points.mjs', 'asset-loader.v3.mjs', 'occ-rt7.v7.mjs'):
                         published = web_asset(path)
                         assert published == data, f'Published helper differs: {path}'
                         data = published
@@ -175,7 +175,7 @@ def main():
             except PlaywrightTimeout:
                 print(f'{time.monotonic()-started:.1f}s: ' + page.locator('#loadProgress').inner_text(), flush=True)
         result = page.evaluate('window.__renderTest.state()')
-        assert page.locator('body').get_attribute('data-viewer-build') == 'color-nine-v6'
+        assert page.locator('body').get_attribute('data-viewer-build') == 'occ-rt7-v8'
         assert page.locator('#projPointSource').input_value() == 'follow'
         assert page.locator('#pointSourceStatus').get_attribute('data-aggregate-requested-by') == ''
         if args.gss_entry:
@@ -186,6 +186,13 @@ def main():
         assert result['points'] == result['renderedPoints'] == sensor['n'], result
         assert result['projectionPoints'] == sensor['n'] and result['aggregatePoints'] == 0, result
         assert result['occ'] == frame['assets']['occupancy']['n'], result
+        native_semantic = None
+        if frame['assets']['occupancy'].get('label_encoding') == 'rt7-v1':
+            assert page.locator('#colorMode').input_value() == 'rt7'
+            assert page.locator('#classLegend .legend-item').count() == 7
+            semantic = page.evaluate('window.__renderTest.semanticSummary()')
+            assert len(semantic['occ']) == 7 and sum(semantic['occ'].values()) == result['occ']
+            native_semantic = semantic
         assert not errors, errors
         digest = page.evaluate('window.__downloadVerify()')
         assert digest == {k: sensor[k]['sha256'] for k in digest}, digest
@@ -208,7 +215,16 @@ def main():
         assert sum(semantic['occ'].values()) == result['occ']
         assert semantic['points']['Fence'] == semantic['occ']['Fence'] == 0
         assert '未区分 Fence' in page.locator('#semanticModeHint').inner_text()
+        if native_semantic is not None:
+            for name, count in native_semantic['occ'].items():
+                assert semantic['occ'][name] == count, (name, semantic, native_semantic)
+            assert semantic['occ']['Noise'] == 0
         print(json.dumps({'semantic9':semantic, 'color_switch_downloads':0, 'geometry_unchanged':True}), flush=True)
+        if native_semantic is not None:
+            page.locator('#colorMode').select_option('rt7')
+            assert page.evaluate('window.__renderTest.semanticSummary()') == native_semantic
+            assert page.evaluate('window.__renderTest.geometry()') == before_geometry
+            assert len(requests) == before_requests
         page.screenshot(path=str(args.output / 'frame.png'), timeout=60000)
         aggregate_checks = None
         if args.check_aggregate:
@@ -245,6 +261,7 @@ def main():
         if args.disconnect_once and args.check_aggregate:
             assert state['dropped'] and any(r['key'] == point_key and r['range'] and r['status'] == 206 for r in requests)
         result.update(clip=args.clip, verified=True, sha256=digest, seconds=time.monotonic()-started,
+                      native_rt7=native_semantic,
                       build=page.locator('body').get_attribute('data-viewer-build'),
                       published_web=args.published_web, gss_entry_local_fixture=args.gss_entry,
                       initial=initial, aggregate_checks=aggregate_checks, requests=requests,

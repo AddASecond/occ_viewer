@@ -3,13 +3,14 @@ import { createCameraProjector, selectCameraImages } from "./camera.js";
 import { hasSharedStatic, composeSharedPoints } from "./shared-points.mjs";
 import { downloadArrayBuffer } from "./asset-loader.v3.mjs";
 import { createNineClassGroup } from "./semantic-nine.v6.mjs";
+import { occupancyDisplayLabels } from "./occ-rt7.v7.mjs";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 
-const VIEWER_BUILD = 'color-nine-v6';
+const VIEWER_BUILD = 'occ-rt7-v8';
 document.body.dataset.viewerBuild = VIEWER_BUILD;
 const buildLabel = document.getElementById('viewerBuild');
 if (buildLabel) {
-  buildLabel.textContent = 'Viewer v6 · 9 类配色';
+  buildLabel.textContent = 'Viewer v8 · 7 类 OCC';
   buildLabel.title = import.meta.url;
 }
 
@@ -1993,6 +1994,11 @@ async function loadFrame(frameEntry, signal) {
     meta.taxonomy?.fine?.names ||
     meta.class_names ||
     null;
+  if (meta.assets?.occupancy?.label_encoding === 'rt7-v1') {
+    applyProfile({taxonomy: {rt7: meta.assets.occupancy.taxonomy}, ui: {default_color_mode: 'rt7'}});
+  }
+  // Partial profiles rebuild display groups; restore the frame's fine names
+  // afterwards so switching to another palette retains its semantic mapping.
   updateNineClassGroup(classNames || []);
   buildFormatUi();
   const title = `${index.clip_id || index.clip}  ·  ts=${meta.timestamp}  ·  voxel=${(meta.grid && meta.grid.voxel) || meta.voxel}m  ·  occ=${(meta.stats && meta.stats.n_occ) || meta.n_occ}`;
@@ -2024,9 +2030,10 @@ async function loadFrame(frameEntry, signal) {
     if (!buffers || signal.aborted) return;
     try {
       const ijk = new Int32Array(buffers[0]);
-      const labels = new Uint8Array(buffers[1]);
+      const sourceLabels = new Uint8Array(buffers[1]);
+      const labels = occupancyDisplayLabels(sourceLabels, assets, classNames);
       if (ijk.length !== labels.length * 3) throw new Error("体素坐标与标签数量不匹配");
-      exportedOcc = { voxel: meta.voxel, ijk, labels };
+      exportedOcc = { voxel: meta.voxel, ijk, labels, sourceLabels, labelEncoding: assets?.label_encoding };
       applyOccupancy(ijk, labels, meta.voxel, "exported grid");
       loadState("OCC", `已加载 ${labels.length.toLocaleString()} 体素`, signal);
       refreshCamProjections();

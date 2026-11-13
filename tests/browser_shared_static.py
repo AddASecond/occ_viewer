@@ -73,7 +73,7 @@ def main():
                 pending.append((route, path))
                 return
             route.fulfill(body=resources[path[6:]], content_type='application/octet-stream')
-        elif path in ('index.html', 'shared-points.mjs', 'asset-loader.v3.mjs', 'camera.js') or path.startswith('app.'):
+        elif path in ('index.html', 'shared-points.mjs', 'asset-loader.v3.mjs', 'semantic-nine.v6.mjs', 'camera.js') or path.startswith('app.'):
             is_app = path.startswith('app.')
             local = ROOT / 'web' / ('app.js' if is_app else path)
             data = local.read_text()
@@ -113,7 +113,7 @@ def main():
             source = page.evaluate('window.__renderTest.sources()')
             assert source['xyz'] == sensor_xyz and source['canvases'] == [2,2], source
             assert source['aggregate'] == 0, source
-            assert page.locator('#viewerBuild').inner_text() == 'Viewer v5 · 单帧按需'
+            assert page.locator('#viewerBuild').inner_text() == 'Viewer v6 · 9 类配色'
             assert page.locator('#projPointSource').input_value() == 'follow'
             assert page.locator('#pointSourceStatus').get_attribute('data-aggregate-requested-by') == ''
             # The default camera source follows the main switch in both

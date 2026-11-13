@@ -77,6 +77,7 @@ def main():
         assert hashlib.sha256(saved).hexdigest() == args.expected_index_sha256
     manifest = {}
     for local, remote in [('shared-points.mjs', 'shared-points.mjs'),
+                          ('semantic-nine.v6.mjs', 'semantic-nine.v6.mjs'),
                           ('asset-loader.v3.mjs', 'asset-loader.v3.mjs'), ('app.js', args.bundle_name)]:
         data = (ROOT / 'web' / local).read_bytes()
         immutable(PREFIX + remote, data, 'text/javascript')

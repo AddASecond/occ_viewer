@@ -59,7 +59,7 @@ def main():
     index['frames'] = [{'timestamp': args.timestamp, 'meta_uri': '/frame.json', 'n_occ': frame['stats']['n_occ']}]
     meta = rewrite({k: frame[k] for k in ('grid', 'assets', 'stats', 'ego_pose', 'od_boxes', 'taxonomy') if k in frame})
     meta['timestamp'] = args.timestamp
-    entry_name = 'index.point-sources-v5.html'
+    entry_name = 'index.color-nine-v6.html'
     dataset_url = '/db/perception_experiment/main_occ_clips/occ/scenes'
     point_key = frame['assets']['points']['xyz']['key']
     requests, lock = [], Lock()
@@ -142,6 +142,10 @@ def main():
                     assert data == (ROOT / 'web/index.html').read_bytes(), 'Published entry does not match tested source'
                 elif (ROOT / 'web' / path).is_file():
                     data = (ROOT / 'web' / path).read_bytes()
+                    if args.published_web and path in ('semantic-nine.v6.mjs', 'shared-points.mjs', 'asset-loader.v3.mjs'):
+                        published = web_asset(path)
+                        assert published == data, f'Published helper differs: {path}'
+                        data = published
                 else:
                     data = web_asset(path)
                 kind = 'text/html' if path.endswith('.html') else 'text/javascript'
@@ -171,7 +175,7 @@ def main():
             except PlaywrightTimeout:
                 print(f'{time.monotonic()-started:.1f}s: ' + page.locator('#loadProgress').inner_text(), flush=True)
         result = page.evaluate('window.__renderTest.state()')
-        assert page.locator('body').get_attribute('data-viewer-build') == 'point-sources-v5'
+        assert page.locator('body').get_attribute('data-viewer-build') == 'color-nine-v6'
         assert page.locator('#projPointSource').input_value() == 'follow'
         assert page.locator('#pointSourceStatus').get_attribute('data-aggregate-requested-by') == ''
         if args.gss_entry:
@@ -192,6 +196,19 @@ def main():
                    'aggregate_requests': 0,
                    'sensor_bytes': sum(r['bytes'] for r in requests if r['key'] in {sensor[k]['key'] for k in digest})}
         print(json.dumps({'initial': initial}), flush=True)
+        before_geometry = page.evaluate('window.__renderTest.geometry()')
+        before_requests = len(requests)
+        page.locator('#colorMode').select_option('semantic9')
+        assert page.locator('#classLegend .legend-item').count() == 9
+        assert page.locator('[data-group="semantic9"] input').count() == 9
+        assert page.evaluate('window.__renderTest.geometry()') == before_geometry
+        assert len(requests) == before_requests, requests[before_requests:]
+        semantic = page.evaluate('window.__renderTest.semanticSummary()')
+        assert sum(semantic['points'].values()) == sensor['n']
+        assert sum(semantic['occ'].values()) == result['occ']
+        assert semantic['points']['Fence'] == semantic['occ']['Fence'] == 0
+        assert '未区分 Fence' in page.locator('#semanticModeHint').inner_text()
+        print(json.dumps({'semantic9':semantic, 'color_switch_downloads':0, 'geometry_unchanged':True}), flush=True)
         page.screenshot(path=str(args.output / 'frame.png'), timeout=60000)
         aggregate_checks = None
         if args.check_aggregate:
@@ -231,6 +248,7 @@ def main():
                       build=page.locator('body').get_attribute('data-viewer-build'),
                       published_web=args.published_web, gss_entry_local_fixture=args.gss_entry,
                       initial=initial, aggregate_checks=aggregate_checks, requests=requests,
+                      semantic9=semantic,
                       production_gss_http_verified=False, injected_disconnect=state['dropped'])
         (args.output / 'verification.json').write_text(json.dumps(result, indent=2))
         print(json.dumps({k: v for k, v in result.items() if k != 'requests'}), flush=True)

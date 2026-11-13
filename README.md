@@ -15,8 +15,8 @@ rewrite camera images or dataset products. Regression tests are under `tests/`.
 GSS sets `ME_CONFIG_OCC_VIEWER_WEB_ROOT` to
 `/mnt/buckets/robotruck-perception-data/occ-viewer/web`, backed by the object
 prefix `s3://robotruck-perception-data/occ-viewer/web/` and served at
-`https://sakura-gss.tail843345.ts.net/occ-viewer/`. The v5 entry is
-`index.point-sources-v5.html`, referencing `app.point-sources-v5.js`;
+`https://sakura-gss.tail843345.ts.net/occ-viewer/`. The v6 entry is
+`index.color-nine-v6.html`, referencing `app.color-nine-v6.js`;
 ordinary `index.html` is updated too. This is a static-asset deployment, not a
 GSS image rebuild. The publisher overlays an existing initialized web directory:
 its `gss.js`, `format.json` and Three.js `vendor/` assets are retained there.
@@ -28,8 +28,10 @@ Full-resolution streaming, progress and resume behavior (v3) are covered in
 [docs/download-fix-v3.md](docs/download-fix-v3.md).
 The single-frame/aggregate selection contract and lazy network loading
 are described in [docs/point-sources-v4.md](docs/point-sources-v4.md).
-The current v5 entry, visible build ID, follow-3D default and stop-aggregate
+The v5 entry, visible build ID, follow-3D default and stop-aggregate
 control are described in [docs/point-sources-v5.md](docs/point-sources-v5.md).
+The additional nine-class color mode and source-label limitations are described
+in [docs/color-nine-v6.md](docs/color-nine-v6.md). All v5 loading behavior remains.
 
 ## Run
 

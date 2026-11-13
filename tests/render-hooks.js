@@ -1,5 +1,16 @@
 // Test-only instrumentation appended by local HTTP fixtures, never deployed.
 window.__renderTest = {
+  semanticSummary() {
+    const g = activeLabelGroup();
+    const summarize = labels => {
+      inferLabelEncoding(labels);
+      const counts = Object.fromEntries(g.order.map(name => [name, 0]));
+      const lut = Array.from({length:256}, (_, i) => labelToGroupName(g, i));
+      for (const lab of labels || []) counts[lut[lab]]++;
+      return counts;
+    };
+    return {mode: colorModeValue(), points: summarize(ptLabels), occ: summarize(occLabels)};
+  },
   state() {
     return {finished: loadFinished, states: [...loadStates.values()], timestamp: currentMeta?.timestamp,
       camera: camera.position.toArray(), target: controls.target.toArray(),

@@ -28,6 +28,7 @@ class DeploymentTest(unittest.TestCase):
 
     def test_versioned_html_entry(self):
         self.assertEqual(versioned_entry('app.point-sources-v5.js'), 'index.point-sources-v5.html')
+        self.assertEqual(versioned_entry('app.color-nine-v6.js'), 'index.color-nine-v6.html')
         for value in ['../app.js', 'app.js', 'app.x.js/../index.html']:
             with self.assertRaises(ValueError):
                 versioned_entry(value)

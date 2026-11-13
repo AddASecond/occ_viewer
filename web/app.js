@@ -2,13 +2,14 @@ import * as THREE from "three";
 import { createCameraProjector, selectCameraImages } from "./camera.js";
 import { hasSharedStatic, composeSharedPoints } from "./shared-points.mjs";
 import { downloadArrayBuffer } from "./asset-loader.v3.mjs";
+import { createNineClassGroup } from "./semantic-nine.v6.mjs";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 
-const VIEWER_BUILD = 'point-sources-v5';
+const VIEWER_BUILD = 'color-nine-v6';
 document.body.dataset.viewerBuild = VIEWER_BUILD;
 const buildLabel = document.getElementById('viewerBuild');
 if (buildLabel) {
-  buildLabel.textContent = 'Viewer v5 · 单帧按需';
+  buildLabel.textContent = 'Viewer v6 · 9 类配色';
   buildLabel.title = import.meta.url;
 }
 
@@ -136,6 +137,7 @@ const el = {
   groupToggles: document.getElementById("groupToggles"),
   lidarToggles: document.getElementById("lidarToggles"),
   colorModeHint: document.getElementById("colorModeHint"),
+  semanticModeHint: document.getElementById("semanticModeHint"),
   roiDefaultHint: document.getElementById("roiDefaultHint"),
   roiX0: document.getElementById("roiX0"),
   roiX1: document.getElementById("roiX1"),
@@ -251,8 +253,19 @@ function buildLabelGroup(id, g = {}) {
     fineSets,
     rawSets,
     rawMax,
+    description: g.description || '',
     noiseName: order.includes("noise") ? "noise" : order[order.length - 1],
   };
+}
+
+function updateNineClassGroup(names = []) {
+  const base = labelGroups.find(g => ['dynamic', 'static', 'drivable', 'non_drivable']
+    .every(name => g.order.includes(name)));
+  const group = buildLabelGroup('semantic9', createNineClassGroup(names, base));
+  const i = labelGroups.findIndex(g => g.id === group.id);
+  if (i >= 0) labelGroups[i] = group;
+  else labelGroups.push(group);
+  groupById = new Map(labelGroups.map(g => [g.id, g]));
 }
 
 function applyProfile(p = {}) {
@@ -277,7 +290,7 @@ function applyProfile(p = {}) {
   if (taxonomyExclude.size > excludeBefore) {
     labelGroups = labelGroups.filter((g) => !taxonomyExclude.has(g.id));
   }
-  groupById = new Map(labelGroups.map((g) => [g.id, g]));
+  updateNineClassGroup(t.fine?.names || []);
   const L = t.lidar_ids;
   if (L && L.colors_rgb) {
     Lcol = Array.isArray(L.colors_rgb)
@@ -961,13 +974,18 @@ async function requestPointSources() {
 
 function inferLabelEncoding(labels) {
   if (!labels || !labels.length) return labelEncoding;
+  // Honor a declared encoding. Named fine taxonomy also disambiguates a
+  // fine cloud containing only low IDs (e.g. Car/Truck), not raw 5-class IDs.
+  const declared = currentMeta?.label_encoding || index?.label_encoding;
+  if (declared === 'fine' || declared === 'raw') return (labelEncoding = declared);
   const rg = labelGroups.find((g) => g.rawSets);
-  if (!rg) {
+  if (!rg || classNames?.length > rg.rawMax + 1) {
     labelEncoding = "fine";
     return labelEncoding;
   }
   let max = 0;
   for (let i = 0; i < labels.length; i++) {
+    if (labels[i] === 255) continue; // Noise sentinel is valid in either encoding.
     if (labels[i] > max) max = labels[i];
     if (max > rg.rawMax) break;
   }
@@ -1103,6 +1121,10 @@ function syncColorModeUi() {
     }
   }
   if (el.lidarToggles) el.lidarToggles.style.display = mode === "lidar" ? "block" : "none";
+  if (el.semanticModeHint) {
+    el.semanticModeHint.textContent = activeLabelGroup()?.description || '';
+    el.semanticModeHint.hidden = !el.semanticModeHint.textContent;
+  }
   renderClassLegend();
 }
 
@@ -1593,6 +1615,7 @@ function fillStyleForOccLab(lab) {
 
 const pointProjectionCache = new WeakMap();
 function projectVehToImage(xyz, labels, cam, lidarIds = null) {
+  inferLabelEncoding(labels);
   const project = createCameraProjector(cam);
   const pixel = {};
   const { w, h } = camSize(cam);
@@ -1600,11 +1623,14 @@ function projectVehToImage(xyz, labels, cam, lidarIds = null) {
   const nAll = labels.length;
   const classFilter = el.projClassFilter ? el.projClassFilter.value : "all";
   const classFilterN = classFilter !== "all" ? Number(classFilter) : null;
+  const grp = activeLabelGroup();
+  const labelVis = new Uint8Array(256).fill(1);
+  if (grp) for (let lab = 0; lab < 256; lab++) labelVis[lab] = groupVisible(grp, labelToGroupName(grp, lab));
   const lidVis = new Uint8Array(256).fill(1);
   if (lidarIds) {
     for (let lid = 0; lid < 256; lid++) lidVis[lid] = lidarVisible(lid);
   }
-  const filterKey = `${classFilter}:${lidVis.join('')}`;
+  const filterKey = `${classFilter}:${lidVis.join('')}:${labelVis.join('')}`;
   const cached = pointProjectionCache.get(cam);
   if (cached?.xyz === xyz && cached.labels === labels && cached.lidarIds === lidarIds
       && cached.filterKey === filterKey) return cached.out;
@@ -1617,6 +1643,7 @@ function projectVehToImage(xyz, labels, cam, lidarIds = null) {
   const best = new Int32Array(depth.length).fill(-1);
   const us = new Float64Array(depth.length), vs = new Float64Array(depth.length);
   for (let i = 0; i < nAll; i++) {
+    if (!labelVis[labels[i]]) continue;
     if (lidarIds && !lidVis[lidarIds[i]]) continue;
     if (classFilterN !== null && labels[i] !== classFilterN) continue;
     const o = i * 3;
@@ -1709,6 +1736,7 @@ function drawProjectionOnCanvas(canvas, img, cam, mode, ptMinPx = 1) {
   let n = 0;
   if (mode === "occ" || mode === "both") {
     if (occProjIjk && occProjLabels && occProjLabels.length && activeVoxel) {
+      inferLabelEncoding(occLabels);
       const faces = projectOccCubes(cam);
       const occStyles = new Array(256);
       for (let lab = 0; lab < 256; lab++) occStyles[lab] = fillStyleForOccLab(lab);
@@ -1962,9 +1990,11 @@ async function loadFrame(frameEntry, signal) {
   classColors = resolveClassColors(meta);
   classNames =
     (index && index.taxonomy && index.taxonomy.fine && index.taxonomy.fine.names) ||
+    meta.taxonomy?.fine?.names ||
     meta.class_names ||
     null;
-  renderClassLegend();
+  updateNineClassGroup(classNames || []);
+  buildFormatUi();
   const title = `${index.clip_id || index.clip}  ·  ts=${meta.timestamp}  ·  voxel=${(meta.grid && meta.grid.voxel) || meta.voxel}m  ·  occ=${(meta.stats && meta.stats.n_occ) || meta.n_occ}`;
   el.titleMeta.textContent = title;
   el.titleMeta.title = title;
